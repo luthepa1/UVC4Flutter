@@ -6,9 +6,10 @@ plugins {
 }
 
 android {
-    namespace = "com.example.uvc_manager_example"
+    namespace = "com.serenegiant.flutter.uvc_manager_example"
     compileSdk = flutter.compileSdkVersion
-    ndkVersion = flutter.ndkVersion
+//  ndkVersion = flutter.ndkVersion
+    ndkVersion = "25.1.8937393"
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
@@ -21,7 +22,7 @@ android {
 
     defaultConfig {
         // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
-        applicationId = "com.example.uvc_manager_example"
+        applicationId = "com.serenegiant.flutter.uvc_manager_example"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion
@@ -35,10 +36,23 @@ android {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
         }
     }
 }
 
 flutter {
     source = "../.."
+}
+
+dependencies {
+    implementation("androidx.core:core-ktx:1.16.0")
+    implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("androidx.legacy:legacy-support-v4:1.0.0")
+    implementation("com.serenegiant:common:9.8.2")
+    implementation(project(":aandusb-release"))
+    implementation(project(":flutter-uvc-plugin-release"))
 }

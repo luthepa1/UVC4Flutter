@@ -4,9 +4,9 @@
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity
-            android:name=".MainActivity"
+            android:name="com.serenegiant.flutter.uvc_manager_example.MainActivity"
             android:exported="true"
-            android:launchMode="singleTop"
+            android:launchMode="singleTask"
             android:taskAffinity=""
             android:theme="@style/LaunchTheme"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
@@ -30,6 +30,24 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
+<!-- 永続的パーミッションを保持できるようにしてUVC機器を接続したときに自動的にアプリを起動するようにするためには
+     次の3つを満たす必要がある。
+     1. UsbPermissionActivityをAndroidManifest.xmlへ追加する。
+     2. AUDIO_RECORDパーミッションを取得している。
+     3. Android OSが表示するUSBアクセスパーミッション要求システムダイアログまたはアプリが表示する
+        USBアクセスパーミッション要求ダイアログで常時このアプリが対象のUVC機器を使うようにする。
+-->
+<!--        <activity-->
+<!--            android:name="com.serenegiant.flutter.uvcplugin.UsbPermissionActivity"-->
+<!--            android:theme="@android:style/Theme.NoDisplay"-->
+<!--            android:exported="true">-->
+<!--            <intent-filter>-->
+<!--                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />-->
+<!--            </intent-filter>-->
+<!--            <meta-data-->
+<!--                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"-->
+<!--                android:resource="@xml/device_filter_uvc" />-->
+<!--        </activity>-->
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and

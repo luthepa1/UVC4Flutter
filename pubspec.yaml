@@ -1,7 +1,7 @@
 name: uvc_manager
-description: "A new Flutter plugin project."
+description: "UVC4FlutterAndroid"
 version: 0.0.1
-homepage:
+homepage: https://www.serenegiant.com/
 
 environment:
   sdk: ^3.7.0
@@ -11,11 +11,15 @@ dependencies:
   flutter:
     sdk: flutter
   plugin_platform_interface: ^2.0.2
+  ffi: ^2.1.4
+  path: ^1.9.1
+  logger: ^2.5.0
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^5.0.0
+  ffigen: ^18.0.0
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
@@ -35,8 +39,8 @@ flutter:
   plugin:
     platforms:
       android:
-        package: com.example.uvc_manager
-        pluginClass: UvcManagerPlugin
+        package: com.serenegiant.flutter.uvcplugin
+        pluginClass: UVCManager
 
   # To add assets to your plugin package, add an assets section, like this:
   # assets:
