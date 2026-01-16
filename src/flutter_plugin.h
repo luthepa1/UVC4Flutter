@@ -37,6 +37,7 @@
 
 /**
  * UVC機器との接続状態
+ * should match to device_state_t in aandusb_native.h
  */
 typedef enum device_state {
 	/**
@@ -197,6 +198,7 @@ typedef enum device_state {
 /**
  * Flutterのc#側とUVCコントロール機能の設定値等をやりとりするための構造体定義
  * Flutterのc#側にも同じ構造体を定義する必要がある
+ * should match to uvc_control_info_t in aandusb_native.h
  */
 typedef struct flutter_control_info {
 	uint64_t type;			// UVCコントロールの種類(CTRL_XXXまたはPU_XXX)
@@ -212,6 +214,7 @@ typedef struct flutter_control_info {
 /**
  * Flutterのc#側と映像サイズ設定をやりとりするための構造体定義
  * Flutterのc#側にも同じ構造体を定義する必要がある
+ * should match to uvc_video_size_t in aandusb_native.h
  */
 typedef struct flutter_video_size {
 	uint32_t frame_type;
@@ -253,6 +256,7 @@ typedef struct flutter_video_size {
 
 /**
  * 接続しているUSB機器情報
+ * should match to usb_device_info_t in aandusb_native.h
  */
 typedef struct flutter_device_info {
 	uint32_t vendor_id;

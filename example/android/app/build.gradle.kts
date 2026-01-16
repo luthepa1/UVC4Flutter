@@ -8,16 +8,15 @@ plugins {
 android {
     namespace = "com.serenegiant.flutter.uvc_manager_example"
     compileSdk = flutter.compileSdkVersion
-//  ndkVersion = flutter.ndkVersion
-    ndkVersion = "25.1.8937393"
+    ndkVersion = flutter.ndkVersion
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_11
-        targetCompatibility = JavaVersion.VERSION_11
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
 
     kotlinOptions {
-        jvmTarget = JavaVersion.VERSION_11.toString()
+        jvmTarget = JavaVersion.VERSION_17.toString()
     }
 
     defaultConfig {
@@ -52,7 +51,5 @@ dependencies {
     implementation("androidx.core:core-ktx:1.16.0")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("androidx.legacy:legacy-support-v4:1.0.0")
-    implementation("com.serenegiant:common:9.8.2")
-    implementation(project(":aandusb-release"))
-    implementation(project(":flutter-uvc-plugin-release"))
+    implementation("com.serenegiant:common:9.16.0")
 }

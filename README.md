@@ -94,8 +94,6 @@ A Flutter plugin to access UVC device(s) on Android devices.
   <uses-permission android:name="android.permission.RECORD_AUDIO"/>
   ...
   ```
-* Strongly recommend to add `ndkVersion = "25.1.8937393"` in `build.gradle` because backed libraries itself supports API level 19 and need to build with Android NDK 25.1.8937393.
-  Using other versions of the NDK may cause problems by `libc++_shared.so` and if you want use it with your own risk.
 
 ### Handling camera access permission
 
@@ -414,6 +412,7 @@ Example app includes some classes / widgets to help to manage UVC device, start 
 
 ## Version history
 
-| version | short description |
-|---------|-------------------|
-| 1.0.0   | First release     |
+| version | short description                                            |
+|---------|--------------------------------------------------------------|
+| 1.0.0   | First release                                                |
+| 1.1.0   | Use static libraries of aandusb to use NDK with flutter SDK. |
