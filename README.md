@@ -54,21 +54,6 @@ A Flutter plugin to access UVC device(s) on Android devices.
       }
     }
   ```
-* You will need to import two aar files, `aandusb-<version>.aar` and `uvc-plugin-<version>.aar` into your project and add them to your dependencies something like as follows.
-  Latest version of these aars is "10.10.0".
-  ```groovy
-  configurations.maybeCreate("default")
-  artifacts.add("default", file('aandusb-10.10.0.aar'))
-  ```
-  and
-  ```groovy
-  configurations.maybeCreate("default")
-  artifacts.add("default", file('vc-plugin-10.10.0.aar'))
-  ```
-  or you can copy two aar files into `libs` holder and add them dependencies as follows.
-  ```groovy
-  implementation fileTree(dir: 'libs', include: ['*.aar'])
-  ```
 * Strongly recommend set `android:launchMode="singleTask"` for your activity in `AndroidManifest.xml`.
 * If you want to detect UVC device(s) and automatically start activity and/or want to keep permanent permission of your UVC device(s), add followings in your `AndroidManifest.xml`.
   ```xml
