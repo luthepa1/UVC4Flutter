@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2025 saki t_saki@serenegiant.com
+// Copyright (c) 2020-2026 saki t_saki@serenegiant.com
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -88,6 +88,26 @@ abstract class UVCControllerInterface {
   /// テクスチャを破棄
   Future<Null> releaseTexture() async {
     throw UnimplementedError('releaseTexture() has not been implemented.');
+  }
+
+  /// UACの接続状態を取得
+  device_state uacState() {
+    throw UnimplementedError('uac_state() has not been implemented.');
+  }
+
+  /// UVC機器からの音声取得を開始
+  Future<int> startUAC() async {
+    throw UnimplementedError('start() has not been implemented.');
+  }
+
+  /// UVC機器からの音声取得を終了
+  Future<int> stopUAC() async {
+    throw UnimplementedError('stop() has not been implemented.');
+  }
+
+  /// UAC情報を取得
+  UACInfo getUACInfo() {
+    throw UnimplementedError('getUACInfo() has not been implemented.');
   }
 }
 

@@ -302,9 +302,110 @@ class UVCPluginBindings {
               ffi.Pointer<ffi.Void>)>>('set_preview_surface');
   late final _set_preview_surface = _set_preview_surfacePtr
       .asFunction<int Function(int, int, ffi.Pointer<ffi.Void>)>();
+
+  /// UAC機器との接続状態を取得する
+  /// @param device_id
+  /// @return
+  int get_uac_state(
+    int device_id,
+  ) {
+    return _get_uac_state(
+      device_id,
+    );
+  }
+
+  late final _get_uac_statePtr =
+      _lookup<ffi.NativeFunction<ffi.Int32 Function(ffi.Int32)>>(
+          'get_uac_state');
+  late final _get_uac_state = _get_uac_statePtr.asFunction<int Function(int)>();
+
+  /// 音声取得開始
+  /// 音声データを受信するたびにRegister時に指定したuac_callbackが呼び出される
+  /// @param device_id
+  /// @return
+  int start_uac(
+    int device_id,
+  ) {
+    return _start_uac(
+      device_id,
+    );
+  }
+
+  late final _start_uacPtr =
+      _lookup<ffi.NativeFunction<ffi.Int32 Function(ffi.Int32)>>('start_uac');
+  late final _start_uac = _start_uacPtr.asFunction<int Function(int)>();
+
+  /// 音声取得終了
+  /// @param device_id
+  /// @return
+  int stop_uac(
+    int device_id,
+  ) {
+    return _stop_uac(
+      device_id,
+    );
+  }
+
+  late final _stop_uacPtr =
+      _lookup<ffi.NativeFunction<ffi.Int32 Function(ffi.Int32)>>('stop_uac');
+  late final _stop_uac = _stop_uacPtr.asFunction<int Function(int)>();
+
+  /// 指定した機能の設定情報を取得
+  /// XXX start_uacを呼んだ後でないと正しい値が返らないので注意
+  /// @param device_id
+  /// @param value
+  /// @return
+  int get_uac_info(
+    int device_id,
+    ffi.Pointer<flutter_uac_info_t> value,
+  ) {
+    return _get_uac_info(
+      device_id,
+      value,
+    );
+  }
+
+  late final _get_uac_infoPtr = _lookup<
+      ffi.NativeFunction<
+          ffi.Int32 Function(
+              ffi.Int32, ffi.Pointer<flutter_uac_info_t>)>>('get_uac_info');
+  late final _get_uac_info = _get_uac_infoPtr
+      .asFunction<int Function(int, ffi.Pointer<flutter_uac_info_t>)>();
+
+  /// 音声フレームをフレームキューから読み取る
+  /// @param device_id
+  /// @param data nullptrなら*lenにフレームデータのバイト数をセットするだけで実際の読み取りは行わない
+  /// @param data_len 音声フレームのバイト数
+  /// @param pts_us 音声データ受信時のシステムタイム[マイクロ秒]
+  /// @return
+  int get_uac_frame(
+    int device_id,
+    ffi.Pointer<ffi.Uint8> data,
+    ffi.Pointer<ffi.Uint32> data_len,
+    ffi.Pointer<ffi.Int64> pts_us,
+  ) {
+    return _get_uac_frame(
+      device_id,
+      data,
+      data_len,
+      pts_us,
+    );
+  }
+
+  late final _get_uac_framePtr = _lookup<
+      ffi.NativeFunction<
+          ffi.Int32 Function(
+              ffi.Int32,
+              ffi.Pointer<ffi.Uint8>,
+              ffi.Pointer<ffi.Uint32>,
+              ffi.Pointer<ffi.Int64>)>>('get_uac_frame');
+  late final _get_uac_frame = _get_uac_framePtr.asFunction<
+      int Function(int, ffi.Pointer<ffi.Uint8>, ffi.Pointer<ffi.Uint32>,
+          ffi.Pointer<ffi.Int64>)>();
 }
 
 /// UVC機器との接続状態
+/// should match to device_state_t in aandusb_native.h
 enum device_state {
   /// プラグインが初期化されていない
   UNINITIALIZED(-1),
@@ -332,6 +433,7 @@ enum device_state {
 
 /// Flutterのc#側とUVCコントロール機能の設定値等をやりとりするための構造体定義
 /// Flutterのc#側にも同じ構造体を定義する必要がある
+/// should match to uvc_control_info_t in aandusb_native.h
 @ffi.Packed(1)
 final class flutter_control_info extends ffi.Struct {
   /// UVCコントロールの種類(CTRL_XXXまたはPU_XXX)
@@ -369,10 +471,12 @@ final class flutter_control_info extends ffi.Struct {
 
 /// Flutterのc#側とUVCコントロール機能の設定値等をやりとりするための構造体定義
 /// Flutterのc#側にも同じ構造体を定義する必要がある
+/// should match to uvc_control_info_t in aandusb_native.h
 typedef flutter_control_info_t = flutter_control_info;
 
 /// Flutterのc#側と映像サイズ設定をやりとりするための構造体定義
 /// Flutterのc#側にも同じ構造体を定義する必要がある
+/// should match to uvc_video_size_t in aandusb_native.h
 @ffi.Packed(1)
 final class flutter_video_size extends ffi.Struct {
   @ffi.Uint32()
@@ -415,9 +519,11 @@ final class flutter_video_size extends ffi.Struct {
 
 /// Flutterのc#側と映像サイズ設定をやりとりするための構造体定義
 /// Flutterのc#側にも同じ構造体を定義する必要がある
+/// should match to uvc_video_size_t in aandusb_native.h
 typedef flutter_video_size_t = flutter_video_size;
 
 /// 接続しているUSB機器情報
+/// should match to usb_device_info_t in aandusb_native.h
 @ffi.Packed(1)
 final class flutter_device_info extends ffi.Struct {
   @ffi.Uint32()
@@ -452,7 +558,32 @@ final class flutter_device_info extends ffi.Struct {
 }
 
 /// 接続しているUSB機器情報
+/// should match to usb_device_info_t in aandusb_native.h
 typedef flutter_device_info_t = flutter_device_info;
+
+/// UAC情報
+/// should match to uac_info_t in aandusb_native.h
+@ffi.Packed(1)
+final class flutter_uac_info extends ffi.Struct {
+  @ffi.Int32()
+  external int device_id;
+
+  @ffi.Int32()
+  external int channels;
+
+  @ffi.Int32()
+  external int resolution;
+
+  @ffi.Uint32()
+  external int sampling_freq;
+
+  @ffi.Int32()
+  external int packet_bytes;
+}
+
+/// UAC情報
+/// should match to uac_info_t in aandusb_native.h
+typedef flutter_uac_info_t = flutter_uac_info;
 
 const int MAX_INTERVALS = 128;
 

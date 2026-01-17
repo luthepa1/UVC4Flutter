@@ -303,6 +303,103 @@ int32_t set_preview_surface(
 }
 
 //--------------------------------------------------------------------------------
+/**
+ * UAC機器との接続状態を取得する
+ * @param device_id
+ * @return
+ */
+DART_EXPORT
+int32_t get_uac_state(const int32_t &device_id) {
+	ENTER();
+
+	LOGV("id=%d", device_id);
+	device_state_t result = UNINITIALIZED;
+	std::lock_guard<std::mutex> lock(plugin_lock);
+	if (pluginJava) {
+		result = pluginJava->get_uac_state(device_id);
+	}
+
+	RETURN(result, int32_t);
+}
+
+/**
+ * 音声取得開始
+ * 音声データを受信するたびにRegister時に指定したuac_callbackが呼び出される
+ * @param device_id
+ * @return
+ */
+DART_EXPORT
+int32_t start_uac(int32_t device_id) {
+	ENTER();
+
+	int32_t  result = -1;
+	std::lock_guard<std::mutex> lock(plugin_lock);
+	if (pluginJava) {
+		result = pluginJava->start_uac(device_id);
+	}
+
+	RETURN(result, int32_t);
+}
+
+/**
+ * 音声取得終了
+ * @param device_id
+ * @return
+ */
+DART_EXPORT
+int32_t stop_uac(int32_t device_id) {
+	ENTER();
+
+	int32_t  result = -1;
+	std::lock_guard<std::mutex> lock(plugin_lock);
+	if (pluginJava) {
+		result = pluginJava->stop_uac(device_id);
+	}
+
+	RETURN(result, int32_t);
+}
+
+/**
+ * 指定した機能の設定情報を取得
+ * XXX StartUACを呼んだ後でないと正しい値が返らないので注意
+ * @param device_id
+ * @param value
+ * @return
+ */
+DART_EXPORT
+int32_t get_uac_info(int32_t device_id, uac_info_t *value) {
+	ENTER();
+
+	int32_t  result = -4;
+	std::lock_guard<std::mutex> lock(plugin_lock);
+	if (pluginJava) {
+		result = pluginJava->get_uac_info(device_id, *value);
+	}
+
+	RETURN(result, int32_t);
+}
+
+/**
+ * 音声フレームをフレームキューから読み取る
+ * @param device_id
+ * @param data nullptrなら*lenにフレームデータのバイト数をセットするだけで実際の読み取りは行わない
+ * @param data_len 音声フレームのバイト数
+ * @param pts_us 音声データ受信時のシステムタイム[マイクロ秒]
+ * @return
+ */
+DART_EXPORT
+int32_t get_uac_frame(int32_t device_id, uint8_t *data, uint32_t *data_len, int64_t *pts_us) {
+//	ENTER();
+
+	int32_t  result = -4;
+	std::lock_guard<std::mutex> lock(plugin_lock);
+	if (pluginJava) {
+		result = pluginJava->get_uac_frame(device_id, data, data_len, pts_us);
+	}
+
+	return result; // 	RETURN(result, int32_t);
+}
+//--------------------------------------------------------------------------------
 // JavaのFlutterプラグインオブジェクト(UVCManager)から呼ばれる
 
 static int nativeInit(JNIEnv *env, jobject thiz) {

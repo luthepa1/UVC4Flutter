@@ -41,6 +41,7 @@
 #include "common/jni_utils.h"
 // flutter
 #include "flutter_utils.h"
+#include "flutter_uac_holder.h"
 #include "flutter_uvc_holder.h"
 #include "flutter_plugin_java.h"
 
@@ -53,7 +54,8 @@ namespace serenegiant::flutter {
 FlutterPluginJava::FlutterPluginJava(jobject plugin_java)
 :	plugin_java(plugin_java),
 	m_manager(nullptr),
-	holders()
+	uvc_holders(),
+	uac_holders()
 {
 	ENTER();
 
@@ -101,7 +103,7 @@ void FlutterPluginJava::terminate_all() {
 	std::lock_guard<std::mutex> lock(m_lock);
 
 	LOGV("release holder(s)");
-	for (const auto& iter: holders) {
+	for (const auto& iter: uvc_holders) {
 		LOGD("stop&remove,%d", iter.first);
 		FlutterUVCHolderSp holder = iter.second;
 		if (holder) {
@@ -109,9 +111,36 @@ void FlutterPluginJava::terminate_all() {
 			holder.reset();
 		}
 	}
-	holders.clear();
+	uvc_holders.clear();
 
 	EXIT();
+}
+
+/**
+ * 指定したidに対応するUACHolderSpを取得する
+ * 存在していない場合にcreate_if_absent=trueならUACHolderSpを生成する
+ * @param device_id
+ * @param create_if_absent
+ * @return
+ */
+std::shared_ptr<FlutterUACHolder> FlutterPluginJava::get_uac_holder_locked(const int32_t &device_id, const bool &create_if_absent) {
+	ENTER();
+
+	LOGD("id=%d,create_if_absent=%d", device_id, create_if_absent);
+	LOGD("num holders=%" FMT_SIZE_T, holders.size());
+
+	FlutterUACHolderSp result;
+	auto iter = uac_holders.find(device_id);
+	if (iter != uac_holders.end()) {
+		LOGD("found");
+		result = iter->second;
+	} else if (create_if_absent) {
+		LOGD("UACHolder not found, create new");
+		result = std::make_shared<FlutterUACHolder>(m_manager, device_id);
+		uac_holders[device_id] = result;
+	}
+
+	RET(result);
 }
 
 /**
@@ -122,21 +151,21 @@ void FlutterPluginJava::terminate_all() {
  * @return
  */
 /*private*/
-FlutterUVCHolderSp FlutterPluginJava::get_holder_locked(const int32_t &device_id, const bool &create_if_absent) {
+FlutterUVCHolderSp FlutterPluginJava::get_uvc_holder_locked(const int32_t &device_id, const bool &create_if_absent) {
 	ENTER();
 
 	LOGD("id=%d,create_if_absent=%d", device_id, create_if_absent);
 	LOGD("num holders=%" FMT_SIZE_T, holders.size());
 
 	FlutterUVCHolderSp result;
-	auto iter = holders.find(device_id);
-	if (iter != holders.end()) {
+	auto iter = uvc_holders.find(device_id);
+	if (iter != uvc_holders.end()) {
 		LOGD("found");
 		result = iter->second;
 	} else if (create_if_absent) {
 		LOGD("UVCHolder not found, create new");
 		result = std::make_shared<FlutterUVCHolder>(m_manager, device_id);
-		holders[device_id] = result;
+		uvc_holders[device_id] = result;
 	}
 
 	RET(result);
@@ -153,8 +182,9 @@ int FlutterPluginJava::add(const int32_t &device_id) {
 	int result = -1;
 	{
 		std::lock_guard<std::mutex> lock(m_lock);
-		auto holder = get_holder_locked(device_id, true);
+		auto holder = get_uvc_holder_locked(device_id, true);
 		if (holder) {
+			get_uac_holder_locked(device_id, true);
 			result = 0;
 		}
 	}
@@ -173,20 +203,33 @@ int FlutterPluginJava::add(const int32_t &device_id) {
 void FlutterPluginJava::remove(const int32_t &device_id) {
 	ENTER();
 
-	FlutterUVCHolderSp removed;
+	FlutterUVCHolderSp uvc_removed;
+	FlutterUACHolderSp uac_removed;
 	{
 		std::lock_guard<std::mutex> lock(m_lock);
-		auto iter = holders.find(device_id);
-		if (iter != holders.end()) {
-			removed = iter->second;
-			holders.erase(device_id);
+		auto uvc_iter = uvc_holders.find(device_id);
+		if (uvc_iter != uvc_holders.end()) {
+			uvc_removed = uvc_iter->second;
+			uvc_holders.erase(device_id);
+		}
+		auto uac_iter = uac_holders.find(device_id);
+		if (uac_iter != uac_holders.end()) {
+			uac_removed = uac_iter->second;
+			uac_holders.erase(device_id);
 		}
 	}
-	if (removed) {
+	if (uvc_removed) {
 		LOGD("remove %d", id);
-		removed->stop();
-		send_on_device_changed(device_id, false);
+		uvc_removed->stop();
 		LOGD("remove: finished");
+	}
+	if (uac_removed) {
+		LOGD("remove %d", id);
+		uac_removed->stop();
+		LOGD("remove: finished");
+	}
+	if (uvc_removed || uac_removed) {
+		send_on_device_changed(device_id, false);
 	}
 
 	EXIT();
@@ -202,7 +245,7 @@ bool FlutterPluginJava::is_available(const int32_t &device_id) {
 
 	FlutterUVCHolderSp holder = nullptr;
 	if (m_lock.try_lock()) {
-		holder = get_holder_locked(device_id, false);
+		holder = get_uvc_holder_locked(device_id, false);
 		m_lock.unlock();
 	}
 
@@ -214,13 +257,13 @@ bool FlutterPluginJava::is_available(const int32_t &device_id) {
  * @param device_id
  * @return
  */
-device_state FlutterPluginJava::get_device_state(const int32_t &device_id) {
+device_state_t FlutterPluginJava::get_device_state(const int32_t &device_id) {
 	ENTER();
 
-	device_state result = DISCONNECTED;
+	device_state_t result = DISCONNECTED;
 	FlutterUVCHolderSp holder = nullptr;
 	if (m_lock.try_lock()) {
-		holder = get_holder_locked(device_id, false);
+		holder = get_uvc_holder_locked(device_id, false);
 		m_lock.unlock();
 	}
 	result = holder && holder->is_running() ? STREAMING : CONNECTED;
@@ -250,7 +293,7 @@ int32_t FlutterPluginJava::start(const int32_t &device_id) {
 	int32_t  result = -1;
 	FlutterUVCHolderSp holder = nullptr;
 	if (m_lock.try_lock()) {
-		holder = get_holder_locked(device_id, false);
+		holder = get_uvc_holder_locked(device_id, false);
 		m_lock.unlock();
 	}
 	if (holder) {
@@ -273,7 +316,7 @@ int32_t FlutterPluginJava::stop(const int32_t &device_id) {
 
 	FlutterUVCHolderSp holder = nullptr;
 	if (m_lock.try_lock()) {
-		holder = get_holder_locked(device_id, false);
+		holder = get_uvc_holder_locked(device_id, false);
 		m_lock.unlock();
 	}
 	if (holder) {
@@ -300,8 +343,8 @@ int32_t FlutterPluginJava::set_video_size(const int32_t &device_id,
 	LOGV("id=%d,type=%d,sz(%dx%d)", device_id, frame_type, width, height);
 	int result = -1;
 	std::lock_guard<std::mutex> lock(m_lock);
-	auto iter = holders.find(device_id);
-	if (iter != holders.end()) {
+	auto iter = uvc_holders.find(device_id);
+	if (iter != uvc_holders.end()) {
 		FlutterUVCHolderSp holder = iter->second;
 		if (holder) {
 			result = holder->set_video_size(frame_type, width, height);
@@ -330,8 +373,8 @@ int FlutterPluginJava::get_current_size(
 	int result = -1;
 	if (LIKELY(data)) {
 		std::lock_guard<std::mutex> lock(m_lock);
-		auto iter = holders.find(device_id);
-		if (iter != holders.end()) {
+		auto iter = uvc_holders.find(device_id);
+		if (iter != uvc_holders.end()) {
 			auto &holder = iter->second;
 			if (holder) {
 				*data = holder->get_current_size();
@@ -365,7 +408,7 @@ int32_t FlutterPluginJava::set_preview_window(
 	int result = -1;
 	FlutterUVCHolderSp holder = nullptr;
 	if (m_lock.try_lock()) {
-		holder = get_holder_locked(device_id, false);
+		holder = get_uvc_holder_locked(device_id, false);
 		m_lock.unlock();
 	}
 	if (holder) {
@@ -388,7 +431,7 @@ uint64_t FlutterPluginJava::get_ctrl_supports(const int &device_id) {
 	if (LIKELY(device_id)) {
 		FlutterUVCHolderSp holder = nullptr;
 		if (m_lock.try_lock()) {
-			holder = get_holder_locked(device_id, false);
+			holder = get_uvc_holder_locked(device_id, false);
 			m_lock.unlock();
 		}
 		if (holder) {
@@ -413,7 +456,7 @@ uint64_t FlutterPluginJava::get_proc_supports(const int &device_id) {
 	if (LIKELY(device_id)) {
 		FlutterUVCHolderSp holder = nullptr;
 		if (m_lock.try_lock()) {
-			holder = get_holder_locked(device_id, false);
+			holder = get_uvc_holder_locked(device_id, false);
 			m_lock.unlock();
 		}
 		if (holder) {
@@ -440,7 +483,7 @@ int FlutterPluginJava::get_control_info(const int &device_id, uvc_control_info_t
 	if (LIKELY(device_id)) {
 		FlutterUVCHolderSp holder = nullptr;
 		if (m_lock.try_lock()) {
-			holder = get_holder_locked(device_id, false);
+			holder = get_uvc_holder_locked(device_id, false);
 			m_lock.unlock();
 		}
 		if (holder) {
@@ -468,7 +511,7 @@ int FlutterPluginJava::set_control_value(const int &device_id, const uint64_t &t
 	if (LIKELY(device_id)) {
 		FlutterUVCHolderSp holder = nullptr;
 		if (m_lock.try_lock()) {
-			holder = get_holder_locked(device_id, false);
+			holder = get_uvc_holder_locked(device_id, false);
 			m_lock.unlock();
 		}
 		if (holder) {
@@ -496,7 +539,7 @@ int FlutterPluginJava::get_control_value(const int &device_id, const uint64_t &t
 	if (LIKELY(device_id)) {
 		FlutterUVCHolderSp holder = nullptr;
 		if (m_lock.try_lock()) {
-			holder = get_holder_locked(device_id, false);
+			holder = get_uvc_holder_locked(device_id, false);
 			m_lock.unlock();
 		}
 		if (holder) {
@@ -527,7 +570,7 @@ int FlutterPluginJava::get_supported_size(
 	int result = -5;
 	FlutterUVCHolderSp holder = nullptr;
 	if (m_lock.try_lock()) {
-		holder = get_holder_locked(device_id, false);
+		holder = get_uvc_holder_locked(device_id, false);
 		m_lock.unlock();
 	}
 	if (holder) {
@@ -539,10 +582,132 @@ int FlutterPluginJava::get_supported_size(
 	RETURN(result, int);
 }
 
+//--------------------------------------------------------------------------------
+/**
+ * UAC機器との接続状態を取得する
+ * @param device_id
+ * @return
+ */
+device_state_t FlutterPluginJava::get_uac_state(const int32_t &device_id) {
+	ENTER();
+
+	device_state result = DISCONNECTED;
+	FlutterUACHolderSp holder = nullptr;
+	if (m_lock.try_lock()) {
+		holder = get_uac_holder_locked(device_id, false);
+		m_lock.unlock();
+	}
+	result = holder && holder->is_running() ? STREAMING : CONNECTED;
+
+	RETURN(result, device_state);
+}
+
+/**
+ * 音声取得開始
+ * @param device_id UAC機器識別用のID
+ * @return
+ */
+/*public*/
+int FlutterPluginJava::start_uac(const int32_t &device_id) {
+	ENTER();
+
+	int result = -1;
+	FlutterUACHolderSp holder = nullptr;
+	if (m_lock.try_lock()) {
+		holder = get_uac_holder_locked(device_id, false);
+		m_lock.unlock();
+	}
+	if (holder && !holder->is_running()) {
+		// まだ音声取得開始していないとき
+		result = holder->start();
+	}
+
+	RETURN(result, int);
+}
+
+/**
+ * 音声取得終了
+ * @param device_id UAC機器識別用のID
+ * @return
+ */
+/*public*/
+int FlutterPluginJava::stop_uac(const int32_t &device_id) {
+	ENTER();
+
+	if (LIKELY(device_id)) {
+		FlutterUACHolderSp holder = nullptr;
+		if (m_lock.try_lock()) {
+			holder = get_uac_holder_locked(device_id, false);
+			m_lock.unlock();
+		}
+		if (holder) {
+			holder->stop();
+		}
+	}
+
+	RETURN(0, int);
+}
+
+/**
+ * Flutterへ引き渡す形式の音声取得設定を取得
+ * @param device_id UAC機器識別用のID
+ * @param info
+ * @return
+ */
+/*public*/
+int FlutterPluginJava::get_uac_info(const int32_t &device_id, uac_info_t &info) {
+	ENTER();
+
+	int result = -4;
+	if (LIKELY(device_id)) {
+		FlutterUACHolderSp holder = nullptr;
+		if (m_lock.try_lock()) {
+			holder = get_uac_holder_locked(device_id, false);
+			m_lock.unlock();
+		}
+		if (holder) {
+			result = holder->get_uac_info(info);
+		} else {
+			LOGD("FlutterUACHolder not found! id=%d", device_id);
+		}
+	}
+
+	RETURN(result, int);
+}
+
+/**
+ * 音声フレームをフレームキューから読み取る
+ * @param device_id UAC機器識別用のID
+ * @param data nullptrなら*lenにフレームデータのバイト数をセットするだけで実際の読み取りは行わない
+ * @param data_len 音声フレームのバイト数
+ * @param pts_us 音声データ受信時のシステムタイム[マイクロ秒]
+ * @return
+ */
+/*public*/
+int FlutterPluginJava::get_uac_frame(const int32_t &device_id, uint8_t *data, uint32_t *data_len, int64_t *pts_us) {
+//	ENTER();
+
+	int result = -4;
+	if (LIKELY(device_id)) {
+		FlutterUACHolderSp holder = nullptr;
+		if (m_lock.try_lock()) {
+			holder = get_uac_holder_locked(device_id, false);
+			m_lock.unlock();
+		}
+		if (holder) {
+			result = holder->get_uac_frame(data, data_len, pts_us);
+		} else {
+			LOGD("FlutterUACHolder not found! id=%d", device_id);
+		}
+	}
+
+	return result; // RETURN(result, int);
+}
+
 /*static, private*/
 /**
  * USB機器が接続されたときのコールバック関数
- * @param callback_args UVCMainへのポインタ
+ * @param callback_args FlutterPluginJavaへのポインタ
  * @param device_id
  */
 /*private,static*/
@@ -559,7 +724,7 @@ void FlutterPluginJava::on_device_attach(usb_manager_t*, void *callback_args, in
 
 /**
  * USB機器が取り外されたときのコールバック関数
- * @param callback_args UVCMainへのポインタ
+ * @param callback_args FlutterPluginJavaへのポインタ
  * @param device_id
  */
 void FlutterPluginJava::on_device_detach(usb_manager_t*, void *callback_args, int32_t device_id) {

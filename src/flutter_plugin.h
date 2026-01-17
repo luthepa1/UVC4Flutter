@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2020-2025 saki t_saki@serenegiant.com
+ * Copyright (c) 2020-2026 saki t_saki@serenegiant.com
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -271,6 +271,18 @@ typedef struct flutter_device_info {
 	uint8_t serial[128];
 } __attribute__((__packed__)) flutter_device_info_t;
 
+/**
+ * UAC情報
+ * should match to uac_info_t in aandusb_native.h
+ */
+typedef struct flutter_uac_info {
+	int32_t device_id;
+	int32_t channels;
+	int32_t resolution;
+	uint32_t sampling_freq;
+	int32_t packet_bytes;
+} __attribute__((__packed__)) flutter_uac_info_t;
+
 //--------------------------------------------------------------------------------
 // DartのFlutterプラグイン部分から呼ばれる関数
 
@@ -373,5 +385,51 @@ int32_t set_preview_surface(
 	int32_t device_id,	// jint
 	int64_t tex_id,		// jlong
 	void *jsurface);	// jobject jsurface
+
+/**
+ * UAC機器との接続状態を取得する
+ * @param device_id
+ * @return
+ */
+EXTERN_C
+int32_t get_uac_state(int32_t device_id);
+
+/**
+* 音声取得開始
+* 音声データを受信するたびにRegister時に指定したuac_callbackが呼び出される
+* @param device_id
+* @return
+*/
+EXTERN_C
+int32_t start_uac(int32_t device_id) ;
+
+/**
+ * 音声取得終了
+ * @param device_id
+ * @return
+ */
+EXTERN_C
+int32_t stop_uac(int32_t device_id);
+
+/**
+ * 指定した機能の設定情報を取得
+ * XXX start_uacを呼んだ後でないと正しい値が返らないので注意
+ * @param device_id
+ * @param value
+ * @return
+ */
+EXTERN_C
+int32_t get_uac_info(int32_t device_id, flutter_uac_info_t *value);
+
+/**
+ * 音声フレームをフレームキューから読み取る
+ * @param device_id
+ * @param data nullptrなら*lenにフレームデータのバイト数をセットするだけで実際の読み取りは行わない
+ * @param data_len 音声フレームのバイト数
+ * @param pts_us 音声データ受信時のシステムタイム[マイクロ秒]
+ * @return
+ */
+EXTERN_C
+int32_t get_uac_frame(int32_t device_id, uint8_t *data, uint32_t *data_len, int64_t *pts_us);
 
 #endif //AANDUSB_FLUTTER_PLUGIN_H

@@ -17,6 +17,7 @@ export './src/uvc_controller.dart';
 export './src/uvc_device_info.dart';
 export './src/uvc_preview.dart';
 export './src/uvc_video_size.dart';
+export './src/uac_info.dart';
 export './src/uvc_manager_platform_interface.dart'
   show  UVCManagerPlatform,
         UVCControllerInterface;

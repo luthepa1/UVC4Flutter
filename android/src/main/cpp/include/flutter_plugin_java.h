@@ -27,6 +27,7 @@
 //--------------------------------------------------------------------------------
 // 外部クラスの前方宣言
 namespace serenegiant::flutter {
+class FlutterUACHolder;
 class FlutterUVCHolder;
 }
 // 外部クラスの前方宣言ここまで
@@ -45,12 +46,24 @@ private:
 	/**
 	 * UVC機器のidとUVCHolderSpのペアを保持
 	 */
-	std::unordered_map <int32_t, std::shared_ptr<FlutterUVCHolder>> holders;
+	std::unordered_map <int32_t, std::shared_ptr<FlutterUACHolder>> uac_holders;
+	/**
+	 * UVC機器のidとUVCHolderSpのペアを保持
+	 */
+	std::unordered_map <int32_t, std::shared_ptr<FlutterUVCHolder>> uvc_holders;
 
 	/**
 	 * 使用中のＵＶＣ機器があれば終了させる
 	 */
 	void terminate_all();
+	/**
+	 * 指定したidに対応するUACHolderSpを取得する
+	 * 存在していない場合にcreate_if_absent=trueならUACHolderSpを生成する
+	 * @param device_id
+	 * @param create_if_absent
+	 * @return
+	 */
+	std::shared_ptr<FlutterUACHolder> get_uac_holder_locked(const int32_t &device_id, const bool &create_if_absent);
 	/**
 	 * 指定したidに対応するUVCHolderSpを取得する
 	 * 存在していない場合にcreate_if_absent=trueならUVCHolderSpを生成する
@@ -58,7 +71,7 @@ private:
 	 * @param create_if_absent
 	 * @return
 	 */
-	std::shared_ptr<FlutterUVCHolder> get_holder_locked(const int32_t &device_id, const bool &create_if_absent);
+	std::shared_ptr<FlutterUVCHolder> get_uvc_holder_locked(const int32_t &device_id, const bool &create_if_absent);
 	/**
 	 * UVC機器が接続された時の処理
 	 * @param device_id
@@ -103,7 +116,7 @@ public:
 	 * @param device_id
 	 * @return
 	 */
-	device_state get_device_state(const int32_t &device_id);
+	device_state_t get_device_state(const int32_t &device_id);
 	/**
 	 * 接続機器情報を取得する
 	 * @param device_id
@@ -197,6 +210,42 @@ public:
 	 * @return 0: 成功, 負: エラーコード
 	 */
 	int get_supported_size(const int &device_id, const int32_t &index, int32_t *num_supported, uvc_video_size_t *data);
+	//--------------------------------------------------------------------------------
+	/**
+	 * UAC機器との接続状態を取得する
+	 * @param device_id
+	 * @return
+	 */
+	device_state_t get_uac_state(const int32_t &device_id);
+	/**
+	 * 音声取得開始
+	 * レンダーコールバックを呼び出さないと実際には描画されない
+	 * @param device_id UVC機器識別用のID
+	 * @return
+	 */
+	int start_uac(const int32_t &device_id);
+	/**
+	 * 音声取得終了
+	 * @param device_id UVC機器識別用のID
+	 * @return
+	 */
+	int stop_uac(const int32_t &device_id);
+	/**
+	 * Flutterへ引き渡す形式の音声取得設定を取得
+	 * @param device_id UVC機器識別用のID
+	 * @param info
+	 * @return
+	 */
+	int get_uac_info(const int32_t &device_id, uac_info_t &info);
+	/**
+	 * 音声フレームをフレームキューから読み取る
+	 * @param device_id UVC機器識別用のID
+	 * @param data nullptrなら*lenにフレームデータのバイト数をセットするだけで実際の読み取りは行わない
+	 * @param data_len 音声フレームのバイト数
+	 * @param pts_us 音声データ受信時のシステムタイム[マイクロ秒]
+	 * @return
+	 */
+	int get_uac_frame(const int32_t &device_id, uint8_t *data, uint32_t *data_len, int64_t *pts_us);
 };
 
 typedef std::shared_ptr<FlutterPluginJava> FlutterPluginJavaSp;

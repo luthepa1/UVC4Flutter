@@ -93,6 +93,7 @@ set_property(TARGET yuv1905_static PROPERTY IMPORTED_LOCATION
 
 add_library(flutter-uvc-plugin_objlib OBJECT
     _onload.cpp
+    flutter_uac_holder.cpp
     flutter_uvc_holder.cpp
     flutter_plugin_java.cpp
     flutter_plugin_main.cpp     # Flutter/Dart側から呼び出されるC関数

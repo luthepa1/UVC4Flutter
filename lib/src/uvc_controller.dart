@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2025 saki t_saki@serenegiant.com
+// Copyright (c) 2020-2026 saki t_saki@serenegiant.com
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@ import './uvcplugin_bindings_generated.dart';
 import './uvc_device_info.dart';
 import './uvc_control_info.dart';
 import './uvc_video_size.dart';
+import './uac_info.dart';
 
 //--------------------------------------------------------------------------------
 // 定数達
@@ -152,7 +153,7 @@ void _initNativeApi(ReceivePort port) async {
 }
 
 //--------------------------------------------------------------------------------
-/// UVC機器からの映像取得開始/停止や設定を行うためのコントローラークラス
+/// UVC機器からの映像および音声取得開始/停止や設定を行うためのコントローラークラス
 class UVCController implements UVCControllerInterface {
   /// 機器識別ID
   @override
@@ -304,10 +305,57 @@ class UVCController implements UVCControllerInterface {
     }
   }
 
+  /// UACの接続状態を取得
+  @override
+  device_state uacState() {
+    return device_state.fromValue(_binding.get_uac_state(deviceId));
+  }
+
+  /// UAC機器からの音声取得を開始
+  @override
+  Future<int> startUAC() async {
+    if (_debug) _logger.d("UVCController#start:deviceId=$deviceId,state=${uacState()}");
+    if ((uacState() == device_state.CONNECTED)) {
+      return compute(_startUac, deviceId);
+    } else {
+      return 0;
+    }
+  }
+
+  /// UAC機器からの音声取得を終了
+  @override
+  Future<int> stopUAC() async {
+    if (_debug) _logger.d("UVCController#stop:deviceId=$deviceId,state=${state()}");
+    // stopをcomputeで非同期呼び出しするとテクスチャ/Surfaceの破棄の
+    // タイミングと合わないので直接呼び出す
+    return _binding.start_uac(deviceId);
+  }
+
+  /// UAC情報を取得
+  @override
+  UACInfo getUACInfo() {
+    late UACInfo result;
+    var info = ffi.malloc<flutter_uac_info>();
+    try {
+      _binding.get_uac_info(deviceId, info);
+      result = _createUACInfoFrom(info.ref);
+    } finally {
+      ffi.malloc.free(info);
+    }
+
+    return result;
+  }
+
   /// startの下請け
   /// computeの引数にffiのバインディングを渡すとクラッシュするので通常のdart関数としてラップ
   int _start(int id) {
     return _binding.start(id);
+  }
+
+  /// uacStartの下請け
+  /// computeの引数にffiのバインディングを渡すとクラッシュするので通常のdart関数としてラップ
+  int _startUac(int id) {
+    return _binding.start_uac(id);
   }
 
   /// 映像設定を適用
@@ -600,6 +648,16 @@ DeviceInfo _createDeviceInfoFrom(flutter_device_info info) {
   _arrayToString(info.manufacturer_name),
   _arrayToString(info.product_name),
   _arrayToString(info.serial));
+}
+
+/// FFI経由で読み取ったバックエンド側の情報からUACInfoを生成するヘルパー関数
+UACInfo _createUACInfoFrom(flutter_uac_info info) {
+  return UACInfo(
+      info.device_id,
+      info.channels,
+      info.resolution,
+      info.sampling_freq,
+      info.packet_bytes);
 }
 
 /// uint8_t配列からUTF8と見なしてdartのStringへ変換するヘルパー関数
