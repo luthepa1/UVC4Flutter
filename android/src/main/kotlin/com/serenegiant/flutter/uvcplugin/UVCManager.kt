@@ -164,7 +164,27 @@ class UVCManager: FlutterPlugin, MethodCallHandler, ActivityAware {
       val producer = mTextureRegistry.createSurfaceProducer()
       producer.setSize(width, height)
       mSurfaceProducers.append(producer.id(), producer)
-      // native側へSurfaceをセット
+
+      // Register a surface lifecycle callback so the native C++ layer is notified when
+      // Flutter's rendering surface is destroyed (app backgrounded / screen locked) and
+      // recreated (app foregrounded). Without this, the native layer keeps a stale/invalid
+      // Surface reference after backgrounding and the Flutter Texture widget shows a
+      // permanent black frame when the app returns to the foreground.
+      producer.setCallback(object : TextureRegistry.SurfaceProducer.Callback {
+        override fun onSurfaceAvailable() {
+          if (DEBUG) Log.v(TAG, "SurfaceProducer.onSurfaceAvailable:deviceId=$deviceId,texId=${producer.id()}")
+          // Surface (re)created — hand the new valid surface to native C++.
+          nativeSetSurface(deviceId, producer.id(), producer.surface)
+        }
+        override fun onSurfaceDestroyed() {
+          if (DEBUG) Log.v(TAG, "SurfaceProducer.onSurfaceDestroyed:deviceId=$deviceId,texId=${producer.id()}")
+          // Surface is going away — clear the native C++ reference to avoid writing to an
+          // invalid surface, which causes crashes / black frames on resume.
+          nativeSetSurface(deviceId, producer.id(), null)
+        }
+      })
+
+      // native側へSurfaceをセット (initial set — may be re-set via callback on resume)
       nativeSetSurface(deviceId, producer.id(), producer.surface)
       if (DEBUG) Log.v(TAG, "createTexture:producer=${producer}")
       return producer.id()

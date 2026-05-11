@@ -96,7 +96,23 @@ class DeviceDetectorFragment constructor() : Fragment() {
 			if (DEBUG) Log.v(TAG, "onStop:unregister USBMonitor")
 			mUSBMonitor!!.unregister()
 		}
-		mDeviceDetector.clearAll()
+		// Replace clearAll() with per-device removal so that the native C++ layer sends
+		// individual on_device_changed(false) messages to Dart for each attached device.
+		// Previously, nativeClearAll() would silently clear native state without notifying
+		// Dart. This created a race condition: if on_device_changed(true) arrived in Dart
+		// (from nativeAdd() on onStart()) before the Dart UVCManager.resumed lifecycle
+		// handler ran to clean up stale controllers, the new controller would be blocked
+		// from being created (containsKey guard), causing openDevice() to never be called
+		// and the camera to show a permanent black/no-device screen after returning from
+		// background (screen lock, app switching, etc.).
+		val devicesToRemove: List<UsbDevice>
+		synchronized(mConnectors) {
+			devicesToRemove = ArrayList(mConnectors.keys)
+		}
+		for (device in devicesToRemove) {
+			if (DEBUG) Log.v(TAG, "onStop:removeDevice:${device.deviceName}")
+			removeDevice(device)
+		}
 		super.onStop()
 	}
 
