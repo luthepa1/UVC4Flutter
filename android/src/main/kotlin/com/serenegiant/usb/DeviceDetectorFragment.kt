@@ -195,6 +195,10 @@ class DeviceDetectorFragment constructor() : Fragment() {
 				addDevice(device)
 			} else {
 				// パーミッションを保持していないとき
+				// Bring the app to the foreground BEFORE requesting USB permission so
+				// the system dialog appears on top of the Flutter activity rather than
+				// behind it (observed on Android 10+ with multi-window / split-screen).
+				bringToForeground()
 				mUSBMonitor!!.requestPermission(device)
 			}
 		}
