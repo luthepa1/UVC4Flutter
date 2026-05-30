@@ -16,6 +16,7 @@ package com.serenegiant.flutter.uvcplugin
  */
 
 import android.app.Activity
+import android.content.Intent
 import android.os.Bundle
 import android.util.Log
 
@@ -23,9 +24,13 @@ class UsbPermissionActivity : Activity() {
 	override fun onCreate(savedInstanceState: Bundle?) {
 		super.onCreate(savedInstanceState)
 		try {
-			// ランチャーアクティビティ(たぶんFlutterActivityのはず)の起動を試みる
+			// Bring the launcher activity (MainActivity / FlutterActivity) to the
+			// foreground so the Android USB permission dialog appears on top of the app
+			// rather than behind it. FLAG_ACTIVITY_REORDER_TO_FRONT ensures this even
+			// when the app is already running in the task stack.
 			val intent = packageManager.getLaunchIntentForPackage(packageName)
 			if (intent != null) {
+				intent.addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_NEW_TASK)
 				startActivity(intent)
 			}
 		} catch (e: Exception) {

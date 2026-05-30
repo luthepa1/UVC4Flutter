@@ -604,12 +604,12 @@ DeviceInfo _createDeviceInfoFrom(flutter_device_info info) {
 
 /// uint8_t配列からUTF8と見なしてdartのStringへ変換するヘルパー関数
 /// @param array
-String _arrayToString(ffi.Array<ffi.Uint8> array) {
+/// @param maxLen max bytes to read (must not exceed array size; defaults to 128)
+String _arrayToString(ffi.Array<ffi.Uint8> array, {int maxLen = 128}) {
   final stringList = <int>[];
-  var i = 0;
-  while (array[i] != 0) {
+  for (var i = 0; i < maxLen; i++) {
+    if (array[i] == 0) break;
     stringList.add(array[i]);
-    i++;
   }
   return String.fromCharCodes(stringList);
 }

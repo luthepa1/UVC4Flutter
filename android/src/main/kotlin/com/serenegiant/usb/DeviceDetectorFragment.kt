@@ -85,6 +85,27 @@ class DeviceDetectorFragment constructor() : Fragment() {
 				"onStart:register USBMonitor," + mUSBMonitor!!.deviceList + "," + mUSBMonitor!!.deviceCount
 			)
 			mUSBMonitor!!.register()
+			// After register(), explicitly re-scan for devices that are already
+			// physically connected. USBMonitor.register() only wires up broadcast
+			// receivers for future USB_DEVICE_ATTACHED intents — it does NOT call
+			// onAttach() for devices already present. Since onStop() removed all
+			// devices via removeDevice(), we must re-add them here or the camera
+			// will never recover after app backgrounding (e.g. switching to Spotify
+			// and back, screen lock, etc.).
+			synchronized(mConnectors) {
+				for (device in mUSBMonitor!!.deviceList.toList()) {
+					if (!mConnectors.containsKey(device)) {
+						if (DEBUG) Log.v(TAG, "onStart:re-scanning already-attached device:" + device.deviceName)
+						if (mUSBMonitor!!.hasPermission(device)) {
+							addDevice(device)
+						} else {
+							// Permission was lost (rare but possible) — re-request.
+							bringToForeground()
+							mUSBMonitor!!.requestPermission(device)
+						}
+					}
+				}
+			}
 		}
 	}
 
@@ -146,7 +167,11 @@ class DeviceDetectorFragment constructor() : Fragment() {
 	 * @param device
 	 */
 	private fun addDevice(device: UsbDevice) {
-		if (DEBUG) Log.v(TAG, "addDevice:" + device.deviceName)
+		addDevice(device, retryCount = 0)
+	}
+
+	private fun addDevice(device: UsbDevice, retryCount: Int) {
+		if (DEBUG) Log.v(TAG, "addDevice:" + device.deviceName + " (attempt ${retryCount + 1})")
 		if (mUSBMonitor!!.hasPermission(device)) {
 			try {
 				val connector = mUSBMonitor!!.openDevice(device)
@@ -155,8 +180,23 @@ class DeviceDetectorFragment constructor() : Fragment() {
 				}
 				mDeviceDetector.add(device, connector.fileDescriptor)
 			} catch (e: IOException) {
-				// ここに来るのはおかしい
-				Log.w(TAG, e)
+				// IOException here usually means USB bus is still settling (e.g. long cable,
+				// hub power droop).  Schedule a single retry after 500 ms so the device still
+				// appears without requiring a physical replug.
+				Log.w(TAG, "addDevice IOException for ${device.deviceName} (attempt ${retryCount + 1}): $e")
+				if (retryCount < 3) {
+					val handler = mAsyncHandler
+					if (handler != null) {
+						handler.postDelayed({
+							// Guard: make sure the device is still attached and we still have permission
+							if (mUSBMonitor != null && mUSBMonitor!!.hasPermission(device)) {
+								addDevice(device, retryCount + 1)
+							}
+						}, 500L * (retryCount + 1))
+					}
+				} else {
+					Log.e(TAG, "addDevice failed after ${retryCount + 1} attempts for ${device.deviceName} — giving up")
+				}
 			}
 		}
 	}
