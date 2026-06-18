@@ -233,6 +233,32 @@ class DeviceDetector private constructor() {
 		}
 
 		/**
+		 * Triggers a re-scan of currently connected USB devices by asking the
+		 * DeviceDetectorFragment to re-check mUSBMonitor.deviceList and add any
+		 * devices not yet tracked in mConnectors.
+		 *
+		 * This handles the case where the initial addDevice() attempt failed
+		 * silently (IOException on slow USB enumeration / long cable) so that
+		 * Dart can request a native-side retry without requiring a full app restart.
+		 *
+		 * Safe to call from the main thread at any time after initUVCDeviceDetector().
+		 *
+		 * @param activity  current Activity (used to find the fragment manager)
+		 */
+		@Suppress("deprecation")
+		@Keep
+		fun rescanUvcDevices(activity: Activity) {
+			if (DEBUG) Log.v(TAG, "rescanUvcDevices:")
+			val fm = activity.getFragmentManager()
+			val detector = fm.findFragmentByTag(DeviceDetectorFragment::class.java.name)
+			if (detector is DeviceDetectorFragment) {
+				detector.rescanConnectedDevices()
+			} else {
+				Log.w(TAG, "rescanUvcDevices: DeviceDetectorFragment not found")
+			}
+		}
+
+		/**
 		 * DeviceDetectorを解放する
 		 * @param activity
 		 */

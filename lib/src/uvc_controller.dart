@@ -567,6 +567,23 @@ class UVCManager with ChangeNotifier, WidgetsBindingObserver implements UVCManag
     });
   }
 
+  /// Re-triggers a native scan of already-attached USB devices.
+  ///
+  /// Calls the "rescanDevices" MethodChannel method, which asks
+  /// DeviceDetectorFragment to re-iterate mUSBMonitor.deviceList and call
+  /// addDevice() for any device not yet tracked.  This recovers from a silent
+  /// IOException during the initial enumeration (long cable, hub power droop)
+  /// without requiring a full app restart.
+  @override
+  Future<void> rescanDevices() async {
+    if (_debug) _logger.d("UVCManager#rescanDevices:");
+    try {
+      await _channel.invokeMethod('rescanDevices');
+    } catch (e) {
+      _logger.w("UVCManager#rescanDevices: error: $e");
+    }
+  }
+
   /// USB機器の接続状態が変化したときの処理
   void _handleOnDeviceChanged(int deviceId, bool attached) {
     if (_debug) _logger.d('UVCManager#onDeviceChanged:deviceId=$deviceId,attached=$attached');

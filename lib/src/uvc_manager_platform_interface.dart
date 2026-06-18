@@ -145,4 +145,16 @@ abstract class UVCManagerPlatform extends PlatformInterface {
     throw UnimplementedError('keepScreenOn() has not been implemented.');
   }
 
+  /// Re-triggers a native scan of all currently attached USB devices.
+  ///
+  /// Use this when the Dart side reports zero cameras despite permissions being
+  /// granted and the device being physically connected.  The native
+  /// DeviceDetectorFragment will re-iterate mUSBMonitor.deviceList and call
+  /// addDevice() for any device not already tracked — recovering from a silent
+  /// IOException that killed the first addDevice() attempt (slow USB enumeration
+  /// on long cables / hub power droop).
+  Future<void> rescanDevices() async {
+    throw UnimplementedError('rescanDevices() has not been implemented.');
+  }
+
 }

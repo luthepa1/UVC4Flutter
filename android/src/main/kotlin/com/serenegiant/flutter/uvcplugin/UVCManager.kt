@@ -105,6 +105,20 @@ class UVCManager: FlutterPlugin, MethodCallHandler, ActivityAware {
           mNeedInitialize = true
         }
       }
+      "rescanDevices" -> {
+        // Called by Dart when no camera devices are visible but the USB bus is
+        // active.  Asks DeviceDetectorFragment to iterate mUSBMonitor.deviceList
+        // and re-add any devices whose addDevice() previously failed silently
+        // (e.g. IOException on initial USB enumeration with a long cable).
+        val a = mActivity.get()
+        if (a != null) {
+          if (DEBUG) Log.v(TAG, "onMethodCall#rescanDevices")
+          DeviceDetector.rescanUvcDevices(a)
+          result.success(null)
+        } else {
+          result.error("No Activity", "Activity not available for rescan", null)
+        }
+      }
       "createTexture" -> {
         val deviceId: Int? = call.argument("deviceId")
         val width: Int? = call.argument("width")

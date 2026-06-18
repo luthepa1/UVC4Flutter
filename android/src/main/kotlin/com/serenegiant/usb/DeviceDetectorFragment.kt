@@ -162,6 +162,41 @@ class DeviceDetectorFragment constructor() : Fragment() {
 
 	//--------------------------------------------------------------------------------
 	/**
+	 * Re-scans all currently connected USB devices and attempts to add any that
+	 * aren't already in mConnectors.  Called externally (via MethodChannel) when
+	 * Dart detects that no camera is visible despite the USB bus being active —
+	 * typically because the initial addDevice() attempt failed due to a slow
+	 * enumeration on a long cable or hub power droop.
+	 *
+	 * Safe to call at any time; runs on the calling thread (main thread via the
+	 * UVCManager MethodChannel handler).  Acquires mConnectors lock internally.
+	 */
+	fun rescanConnectedDevices() {
+		if (DEBUG) Log.v(TAG, "rescanConnectedDevices:")
+		val monitor = mUSBMonitor ?: return
+		if (!monitor.isRegistered) {
+			Log.w(TAG, "rescanConnectedDevices: USBMonitor not registered — skip")
+			return
+		}
+		synchronized(mConnectors) {
+			for (device in monitor.deviceList.toList()) {
+				if (!mConnectors.containsKey(device)) {
+					if (DEBUG) Log.v(TAG, "rescanConnectedDevices: re-adding device: ${device.deviceName}")
+					if (monitor.hasPermission(device)) {
+						addDevice(device)
+					} else {
+						bringToForeground()
+						monitor.requestPermission(device)
+					}
+				} else {
+					if (DEBUG) Log.v(TAG, "rescanConnectedDevices: already tracked: ${device.deviceName}")
+				}
+			}
+		}
+	}
+
+	//--------------------------------------------------------------------------------
+	/**
 	 * native側へ登録する
 	 * パーミッションを保持していること
 	 * @param device
