@@ -632,13 +632,25 @@ String _arrayToString(ffi.Array<ffi.Uint8> array, {int maxLen = 128}) {
 }
 
 /// FFI経由で読み取ったバックエンド側の情報からVideoSizeを生成するヘルパー関数
+///
+/// BUG-8: The frame_intervals and fps arrays are fixed-size [MAX_INTERVALS]
+/// (128).  When the MS210x / EasyGrab is mid-re-enumeration the native side can
+/// write garbage into num_frame_intervals / num_fps (values > 128), causing the
+/// unbounded loop to access array[128] — one past the end — raising
+/// `RangeError: Not in inclusive range 0..127: 128`.  This is the same FFI
+/// struct-overrun class as the _arrayToString bug (BUG-7/failure mode 10) but
+/// on the video_size struct instead of the device_info struct.  Bound both
+/// loops to MAX_INTERVALS so the RangeError can never fire.
 VideoSize createVideoSizeFrom(flutter_video_size sz) {
+  final maxIntervals = MAX_INTERVALS; // 128 — matches ffi.Array.multi([128])
   var frameIntervals = <int>[];
-  for (int i = 0; i < sz.num_frame_intervals; i++) {
+  final numFi = sz.num_frame_intervals.clamp(0, maxIntervals);
+  for (int i = 0; i < numFi; i++) {
     frameIntervals.add(sz.frame_intervals[i]);
   }
   var fps = <double>[];
-  for (int i = 0; i < sz.num_fps; i++) {
+  final numFps = sz.num_fps.clamp(0, maxIntervals);
+  for (int i = 0; i < numFps; i++) {
     fps.add(sz.fps[i]);
   }
   return VideoSize(
