@@ -95,8 +95,16 @@ class UVCVideoViewState extends State<UVCVideoView> with WidgetsBindingObserver 
   Future<void> dispose() async {
     if (_debug) _logger.d("_UVCVideoViewState#dispose:");
     WidgetsBinding.instance.removeObserver(this);
-    await _controller.stop();
-    await _controller.releaseTexture();
+    try {
+      await _controller.stop();
+    } catch (e) {
+      _logger.w("_UVCVideoViewState#dispose stop: $e");
+    }
+    try {
+      await _controller.releaseTexture();
+    } catch (e) {
+      _logger.w("_UVCVideoViewState#dispose releaseTexture: $e");
+    }
     super.dispose();
   }
 
@@ -109,25 +117,51 @@ class UVCVideoViewState extends State<UVCVideoView> with WidgetsBindingObserver 
     //     inactive -> resume
     switch (state) {
       case AppLifecycleState.resumed:
-        final sz = await _controller.getCurrentSize();
-        final textureId = await _controller.createTexture(sz.width, sz.height);
-        if (_debug) _logger.d("_UVCVideoViewState#textureId=$textureId,sz=$sz");
-        _controller.start();
-        setState(() {
-          _textureId = textureId;
-          _currentSize = sz;
-        });
+        // Guard: the UVC device may have disconnected or be mid-enumeration
+        // when the app returns to foreground (USB power cycle, sleep/wake,
+        // hub droop).  The FFI calls below (getCurrentSize / createTexture /
+        // start) can throw a RangeError or native exception if the underlying
+        // USB handle is stale or partially initialised.  Without this guard
+        // the exception escapes through the WidgetsBindingObserver dispatch
+        // and crashes the app — which the user perceives as a "restart on
+        // foreground" because Android re-creates the Activity from scratch.
+        try {
+          final sz = await _controller.getCurrentSize();
+          final textureId = await _controller.createTexture(sz.width, sz.height);
+          if (_debug) _logger.d("_UVCVideoViewState#textureId=$textureId,sz=$sz");
+          _controller.start();
+          if (!mounted) return;
+          setState(() {
+            _textureId = textureId;
+            _currentSize = sz;
+          });
+        } catch (e) {
+          _logger.w("_UVCVideoViewState#didChangeAppLifecycleState resumed: $e");
+          // Leave _textureId at -1; VideoGrabManager's own resume handler
+          // will re-detect the device and trigger openDevice() again.
+          if (mounted) {
+            setState(() {
+              _textureId = -1;
+            });
+          }
+        }
         break;
       case AppLifecycleState.inactive:
         break;
       case AppLifecycleState.hidden:
         break;
       case AppLifecycleState.paused:
-        await _controller.stop();
-        await _controller.releaseTexture();
-        setState(() {
-          _textureId = -1;
-        });
+        try {
+          await _controller.stop();
+          await _controller.releaseTexture();
+        } catch (e) {
+          _logger.w("_UVCVideoViewState#didChangeAppLifecycleState paused: $e");
+        }
+        if (mounted) {
+          setState(() {
+            _textureId = -1;
+          });
+        }
         break;
       case AppLifecycleState.detached:
         break;
