@@ -48,6 +48,16 @@ class DeviceDetectorFragment constructor() : Fragment() {
 	private val mConnectors: MutableMap<UsbDevice, UsbConnector> = HashMap()
 	private var mUSBMonitor: USBMonitor? = null
 	private var mAsyncHandler: Handler? = null
+	// fdsan graveyard — hold strong refs to UsbConnector objects that have been
+	// explicitly closed via removeDevice().  The serenegiant libcommon UsbConnector
+	// has a finalize() that calls close() unconditionally; if the GC runs after we
+	// already closed the underlying UsbDeviceConnection FD, the finalizer
+	// double-closes the (now-reused) FD and bionic's fdsan SIGABRTs the process
+	// (seen in logcat as: FinalizerDaemon → UsbConnector.finalize → usb_device_close
+	// → fdsan: attempted to close file descriptor N, expected to be unowned).
+	// Keeping the references alive until onDetach() prevents the finalizer from
+	// running while the fragment is active, eliminating the double-close window.
+	private val mClosedConnectorGraveyard: MutableList<UsbConnector> = mutableListOf()
 
 	@Deprecated("Deprecated in Java")
 	@Suppress("deprecation")
@@ -145,6 +155,13 @@ class DeviceDetectorFragment constructor() : Fragment() {
 		if (mUSBMonitor != null) {
 			mUSBMonitor!!.destroy()
 			mUSBMonitor = null
+		}
+		// Release the graveyard — the fragment is being destroyed, the Activity
+		// is going away, and the finalizer double-close can no longer race with
+		// a new openDevice() reusing the same FD.  This lets the GC reclaim the
+		// closed UsbConnector objects now that the process is tearing down.
+		synchronized(mClosedConnectorGraveyard) {
+			mClosedConnectorGraveyard.clear()
 		}
 		synchronized(mSync) {
 			if (mAsyncHandler != null) {
@@ -247,6 +264,13 @@ class DeviceDetectorFragment constructor() : Fragment() {
 			if (mConnectors.containsKey(device)) {
 				val removed = mConnectors.remove(device)
 				removed?.close()
+				// Retain a strong reference so the GC finalizer (UsbConnector.finalize)
+				// cannot run and double-close the already-closed FD — fdsan SIGABRT.
+				if (removed != null) {
+					synchronized(mClosedConnectorGraveyard) {
+						mClosedConnectorGraveyard.add(removed)
+					}
+				}
 			}
 		}
 	}
