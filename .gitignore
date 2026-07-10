@@ -1,0 +1,6 @@
+# Android NDK build artifacts
+android/.cxx/
+
+# Archives
+*.tar.gz
+*.tgz
