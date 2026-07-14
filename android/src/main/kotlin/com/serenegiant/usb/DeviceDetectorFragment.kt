@@ -22,8 +22,11 @@ import android.content.Intent
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbInterface
 import android.os.Handler
+import android.os.Looper
 import android.util.Log
+import android.view.WindowInsets
 import androidx.annotation.Keep
+import androidx.core.view.WindowInsetsControllerCompat
 import com.serenegiant.usb.DeviceDetector.DeviceDetectorCallback
 import com.serenegiant.system.PermissionUtils
 import com.serenegiant.usb.DeviceFilter
@@ -31,6 +34,7 @@ import com.serenegiant.usb.USBMonitor
 import com.serenegiant.usb.UsbConnector
 import com.serenegiant.utils.HandlerThreadHandler
 import java.io.IOException
+import kotlin.math.max
 
 /**
  * USB関係のイベントの処理のためにContextが必要なので
@@ -55,9 +59,97 @@ class DeviceDetectorFragment constructor() : Fragment() {
 	// double-closes the (now-reused) FD and bionic's fdsan SIGABRTs the process
 	// (seen in logcat as: FinalizerDaemon → UsbConnector.finalize → usb_device_close
 	// → fdsan: attempted to close file descriptor N, expected to be unowned).
-	// Keeping the references alive until onDetach() prevents the finalizer from
-	// running while the fragment is active, eliminating the double-close window.
+	//
+	// This is a companion-object (process-lifetime) graveyard, NOT an instance
+	// field. The previous instance-field graveyard was cleared in onDetach(),
+	// but the GC could run after fragment destruction and still finalize the
+	// connectors — the crash logcat (2026-07-11) shows FinalizerDaemon triggering
+	// 6 seconds after removeDevice closed the connector. A process-lifetime
+	// graveyard ensures the finalizer never runs until the process exits.
+	// We cap it to 32 entries to avoid unbounded memory growth across many
+	// open/close cycles; once full, the oldest entry is released (its FD is
+	// long-closed by now, and the OS will have moved on to new FDs).
 	private val mClosedConnectorGraveyard: MutableList<UsbConnector> = mutableListOf()
+
+	companion object {
+		private const val TAG = "DeviceDetectorFragment"
+		private const val DEBUG = false
+
+		// Process-lifetime graveyard for closed UsbConnector objects.
+		// See the comment on mClosedConnectorGraveyard above for the full
+		// explanation of the fdsan double-close crash.
+		private val sGlobalGraveyard: MutableList<UsbConnector> = mutableListOf()
+		private val sRetainReasonCounts: MutableMap<String, Int> = mutableMapOf()
+		private var sRetainTotalCount: Int = 0
+		private const val RETAIN_SUMMARY_EVERY = 25
+		private const val RETAIN_STORM_THRESHOLD = 100
+		private const val RETAIN_STORM_WINDOW_MS = 30_000L
+		private const val RETAIN_STORM_WARN_COOLDOWN_MS = 10_000L
+		private val sRetainTimestampsMs: ArrayDeque<Long> = ArrayDeque()
+		private var sLastStormWarnAtMs: Long = 0L
+
+		/// Add a closed UsbConnector to the process-lifetime graveyard so its
+		/// finalizer cannot run and double-close the already-closed FD.
+		private fun retainClosedConnector(
+			connector: UsbConnector,
+			reason: String,
+			deviceName: String? = null
+		) {
+			synchronized(sGlobalGraveyard) {
+				sGlobalGraveyard.add(connector)
+				sRetainTotalCount += 1
+				val updatedReasonCount = (sRetainReasonCounts[reason] ?: 0) + 1
+				sRetainReasonCounts[reason] = updatedReasonCount
+
+				val nowMs = System.currentTimeMillis()
+				sRetainTimestampsMs.addLast(nowMs)
+				while (sRetainTimestampsMs.isNotEmpty() &&
+					(nowMs - sRetainTimestampsMs.first()) > RETAIN_STORM_WINDOW_MS) {
+					sRetainTimestampsMs.removeFirst()
+				}
+				val retainInWindow = sRetainTimestampsMs.size
+				Log.i(
+					TAG,
+					"retainClosedConnector: reason=$reason device=${deviceName ?: "unknown"} " +
+						"connectorHash=${System.identityHashCode(connector)} globalSize=${sGlobalGraveyard.size} " +
+						"reasonCount=$updatedReasonCount total=$sRetainTotalCount inWindow30s=$retainInWindow"
+				)
+
+				if (retainInWindow >= RETAIN_STORM_THRESHOLD) {
+					val timeSinceLastWarn = nowMs - sLastStormWarnAtMs
+					if (timeSinceLastWarn >= RETAIN_STORM_WARN_COOLDOWN_MS) {
+						sLastStormWarnAtMs = nowMs
+						val summary = sRetainReasonCounts.entries
+							.sortedByDescending { it.value }
+							.joinToString(", ") { "${it.key}=${it.value}" }
+						val oldestAgeMs = if (sRetainTimestampsMs.isNotEmpty()) {
+							max(0L, nowMs - sRetainTimestampsMs.first())
+						} else {
+							0L
+						}
+						Log.w(
+							TAG,
+							"retainClosedConnector STORM: retains=$retainInWindow within ${RETAIN_STORM_WINDOW_MS}ms " +
+								"(oldestAgeMs=$oldestAgeMs, threshold=$RETAIN_STORM_THRESHOLD) " +
+								"globalSize=${sGlobalGraveyard.size} total=$sRetainTotalCount byReason=[$summary]"
+						)
+					}
+				}
+
+				if (sRetainTotalCount % RETAIN_SUMMARY_EVERY == 0) {
+					val summary = sRetainReasonCounts.entries
+						.sortedByDescending { it.value }
+						.joinToString(", ") { "${it.key}=${it.value}" }
+					Log.i(
+						TAG,
+						"retainClosedConnector summary: total=$sRetainTotalCount globalSize=${sGlobalGraveyard.size} byReason=[$summary]"
+					)
+				}
+			}
+		}
+
+		private const val ARGS_DEVICE_FILTERS = "ARGS_DEVICE_FILTERS"
+	}
 
 	@Deprecated("Deprecated in Java")
 	@Suppress("deprecation")
@@ -111,6 +203,7 @@ class DeviceDetectorFragment constructor() : Fragment() {
 						} else {
 							// Permission was lost (rare but possible) — re-request.
 							bringToForeground()
+							exitImmersiveMode()
 							mUSBMonitor!!.requestPermission(device)
 						}
 					}
@@ -156,10 +249,11 @@ class DeviceDetectorFragment constructor() : Fragment() {
 			mUSBMonitor!!.destroy()
 			mUSBMonitor = null
 		}
-		// Release the graveyard — the fragment is being destroyed, the Activity
-		// is going away, and the finalizer double-close can no longer race with
-		// a new openDevice() reusing the same FD.  This lets the GC reclaim the
-		// closed UsbConnector objects now that the process is tearing down.
+		// Release the instance graveyard — the fragment is being destroyed.
+		// The global graveyard (sGlobalGraveyard) is process-lifetime and NOT
+		// cleared here, because the GC may still run after onDetach and the
+		// finalizer must not double-close the FDs. The instance graveyard is
+		// redundant with the global one, so clearing it is safe.
 		synchronized(mClosedConnectorGraveyard) {
 			mClosedConnectorGraveyard.clear()
 		}
@@ -203,6 +297,7 @@ class DeviceDetectorFragment constructor() : Fragment() {
 						addDevice(device)
 					} else {
 						bringToForeground()
+						exitImmersiveMode()
 						monitor.requestPermission(device)
 					}
 				} else {
@@ -225,17 +320,33 @@ class DeviceDetectorFragment constructor() : Fragment() {
 	private fun addDevice(device: UsbDevice, retryCount: Int) {
 		if (DEBUG) Log.v(TAG, "addDevice:" + device.deviceName + " (attempt ${retryCount + 1})")
 		if (mUSBMonitor!!.hasPermission(device)) {
+			var connector: UsbConnector? = null
+			var storedInMap = false
 			try {
-				val connector = mUSBMonitor!!.openDevice(device)
+				connector = mUSBMonitor!!.openDevice(device)
 				synchronized(mConnectors) {
 					mConnectors.put(device, connector)
 				}
+				storedInMap = true
 				mDeviceDetector.add(device, connector.fileDescriptor)
 			} catch (e: IOException) {
 				// IOException here usually means USB bus is still settling (e.g. long cable,
 				// hub power droop).  Schedule a single retry after 500 ms so the device still
 				// appears without requiring a physical replug.
 				Log.w(TAG, "addDevice IOException for ${device.deviceName} (attempt ${retryCount + 1}): $e")
+
+				// If the connector was opened but not stored in mConnectors (exception
+				// between openDevice and mConnectors.put), close it and retain it in the
+				// graveyard to prevent the fdsan double-close from its finalizer.
+				if (connector != null && !storedInMap) {
+					try { connector.close() } catch (_: Exception) {}
+					retainClosedConnector(
+						connector,
+						reason = "addDevice IOException before map insert",
+						deviceName = device.deviceName
+					)
+				}
+
 				if (retryCount < 3) {
 					val handler = mAsyncHandler
 					if (handler != null) {
@@ -248,6 +359,31 @@ class DeviceDetectorFragment constructor() : Fragment() {
 					}
 				} else {
 					Log.e(TAG, "addDevice failed after ${retryCount + 1} attempts for ${device.deviceName} — giving up")
+				}
+			} catch (e: Exception) {
+				Log.e(TAG, "addDevice unexpected exception for ${device.deviceName} (attempt ${retryCount + 1})", e)
+
+				// Defensive cleanup for non-IOException paths so we never leave a
+				// connector reachable only by GC finalizer.
+				if (storedInMap) {
+					val removed: UsbConnector? = synchronized(mConnectors) {
+						mConnectors.remove(device)
+					}
+					if (removed != null) {
+						try { removed.close() } catch (_: Exception) {}
+						retainClosedConnector(
+							removed,
+							reason = "addDevice unexpected exception after map insert",
+							deviceName = device.deviceName
+						)
+					}
+				} else if (connector != null) {
+					try { connector.close() } catch (_: Exception) {}
+					retainClosedConnector(
+						connector,
+						reason = "addDevice unexpected exception before map insert",
+						deviceName = device.deviceName
+					)
 				}
 			}
 		}
@@ -264,9 +400,16 @@ class DeviceDetectorFragment constructor() : Fragment() {
 			if (mConnectors.containsKey(device)) {
 				val removed = mConnectors.remove(device)
 				removed?.close()
-				// Retain a strong reference so the GC finalizer (UsbConnector.finalize)
-				// cannot run and double-close the already-closed FD — fdsan SIGABRT.
+				// Retain a strong reference in the process-lifetime graveyard so
+				// the GC finalizer (UsbConnector.finalize) cannot run and
+				// double-close the already-closed FD — fdsan SIGABRT.
 				if (removed != null) {
+					retainClosedConnector(
+						removed,
+						reason = "removeDevice normal detach",
+						deviceName = device.deviceName
+					)
+					// Also keep in instance graveyard for backward compat.
 					synchronized(mClosedConnectorGraveyard) {
 						mClosedConnectorGraveyard.add(removed)
 					}
@@ -286,6 +429,50 @@ class DeviceDetectorFragment constructor() : Fragment() {
 		}
 	}
 
+	// ── Immersive-mode management ──────────────────────────────────────────
+	// The host app runs in SystemUiMode.immersiveSticky (set from Dart).  On
+	// some devices (Lenovo TB373FU / Android 16) the system USB-permission
+	// dialog appears BEHIND the fullscreen activity, making it invisible.
+	// These helpers temporarily show the system bars so the dialog is visible,
+	// then re-hide them after the user responds.
+	private var immersiveRestoreHandler: Handler? = Handler(Looper.getMainLooper())
+
+	private fun exitImmersiveMode() {
+		val activity = activity ?: return
+		// Must run on the main thread — WindowInsetsControllerCompat touches
+		// the view hierarchy, which is only allowed from the thread that
+		// created it.  The USBMonitor.Callback.onAttach fires on the
+		// UsbDetector async handler thread, so without runOnUiThread the
+		// call silently fails with "Only the original thread that created
+		// a view hierarchy can touch its views" and the system bars are
+		// never shown — leaving the USB permission dialog invisible behind
+		// the fullscreen immersive activity (Lenovo TB373FU / Android 16).
+		activity.runOnUiThread {
+			try {
+				val window = activity.window ?: return@runOnUiThread
+				val controller = WindowInsetsControllerCompat(window, window.decorView)
+				controller.show(WindowInsets.Type.systemBars())
+				if (DEBUG) Log.d(TAG, "exitImmersiveMode: showed system bars for USB permission dialog")
+			} catch (e: Exception) {
+				Log.w(TAG, "exitImmersiveMode failed: ${e.message}")
+			}
+		}
+	}
+
+	private fun restoreImmersiveMode() {
+		try {
+			val activity = activity ?: return
+			val window = activity.window ?: return
+			val controller = WindowInsetsControllerCompat(window, window.decorView)
+			controller.hide(WindowInsets.Type.systemBars())
+			controller.systemBarsBehavior =
+				WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+			if (DEBUG) Log.d(TAG, "restoreImmersiveMode: re-hid system bars")
+		} catch (e: Exception) {
+			Log.w(TAG, "restoreImmersiveMode failed: ${e.message}")
+		}
+	}
+
 	private val mOnDeviceConnectListener: USBMonitor.Callback = object : USBMonitor.Callback {
 		override fun onAttach(device: UsbDevice) {
 			if (DEBUG) Log.v(TAG, "Callback#onAttach:" + device.deviceName)
@@ -297,7 +484,10 @@ class DeviceDetectorFragment constructor() : Fragment() {
 				// Bring the app to the foreground BEFORE requesting USB permission so
 				// the system dialog appears on top of the Flutter activity rather than
 				// behind it (observed on Android 10+ with multi-window / split-screen).
+				// Also exit immersive mode so the dialog is not hidden behind the
+				// fullscreen activity on devices like Lenovo TB373FU / Android 16.
 				bringToForeground()
+				exitImmersiveMode()
 				mUSBMonitor!!.requestPermission(device)
 			}
 		}
@@ -308,6 +498,9 @@ class DeviceDetectorFragment constructor() : Fragment() {
 			// システムダイアログが表示されている状態でアプリ上に表示されているパーミッションダイアログで許可すると
 			// システムダイアログが表示されたままになるのでアプリをフォアグラウンドへ移動させる
 			bringToForeground()
+			// Restore immersive mode after the dialog is dismissed (delayed so
+			// the dialog dismiss animation completes before we re-hide bars).
+			immersiveRestoreHandler?.postDelayed({ restoreImmersiveMode() }, 300)
 		}
 
 		override fun onConnected(
@@ -399,12 +592,5 @@ class DeviceDetectorFragment constructor() : Fragment() {
 		if (DEBUG) Log.v(TAG, "コンストラクタ:")
 		// Activity再生成時にもこのFragmentの再生成をしない
 		retainInstance = true
-	}
-
-	companion object {
-		private const val DEBUG = false // set false on production
-		private val TAG: String = DeviceDetectorFragment::class.java.simpleName
-
-		private const val ARGS_DEVICE_FILTERS = "ARGS_DEVICE_FILTERS"
 	}
 }
