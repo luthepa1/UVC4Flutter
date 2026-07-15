@@ -45,6 +45,11 @@
 #include "flutter_plugin.h"
 #include "flutter_plugin_java.h"
 
+// Linux USBDEVFS_RESET ioctl
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/usbdevice_fs.h>
+
 // Java側オブジェクトのFQCN
 #define FQCN_JAVA_PLUGIN "com/serenegiant/flutter/uvcplugin/UVCManager"
 
@@ -361,11 +366,50 @@ static int nativeRelease(JNIEnv *, jobject) {
 }
 
 //================================================================================
+// BUG-22: native USB bus reset via USBDEVFS_RESET ioctl.
+// Called from DeviceDetectorFragment.resetUsbDevice() to force a USB device
+// to re-enumerate from scratch, clearing corrupted descriptors after a hub
+// power droop.  Returns 0 on success, negative errno on failure.
+static jint nativeUsbReset(JNIEnv *env, jobject, jstring devicePath) {
+	ENTER();
+
+	const char *path = env->GetStringUTFChars(devicePath, nullptr);
+	if (!path) {
+		RETURN(-EINVAL, jint);
+	}
+
+	int fd = open(path, O_RDWR);
+	if (fd < 0) {
+		LOGW("nativeUsbReset: open failed for %s: %s", path, strerror(errno));
+		env->ReleaseStringUTFChars(devicePath, path);
+		RETURN(-errno, jint);
+	}
+
+	int ret = ioctl(fd, USBDEVFS_RESET);
+	if (ret < 0) {
+		LOGW("nativeUsbReset: ioctl USBDEVFS_RESET failed for %s: %s", path, strerror(errno));
+		ret = -errno;
+	} else {
+		LOGI("nativeUsbReset: USBDEVFS_RESET succeeded for %s", path);
+	}
+
+	close(fd);
+	env->ReleaseStringUTFChars(devicePath, path);
+
+	RETURN(ret, jint);
+}
+
+//================================================================================
 static JNINativeMethod methods[] = {
 	{ "nativeInit",	"()I", (void *) nativeInit },
 	{ "nativeRelease",	"()I", (void *) nativeRelease },
 
 	{ "nativeSetSurface",	"(IJLandroid/view/Surface;)I", (void *) nativeSetSurface },
+};
+
+// Native methods registered on DeviceDetectorFragment for USB bus reset.
+static JNINativeMethod detectorMethods[] = {
+	{ "nativeUsbReset",	"(Ljava/lang/String;)I", (void *) nativeUsbReset },
 };
 
 
@@ -378,6 +422,15 @@ int register_plugin(JNIEnv *env) {
 		methods, NUM_ARRAY_ELEMENTS(methods)) < 0) {
 		env->ExceptionClear();
 		return -1;
+	}
+
+	// BUG-22: Register nativeUsbReset on DeviceDetectorFragment
+	if (sere::registerNativeMethods(env,
+		"com/serenegiant/usb/DeviceDetectorFragment",
+		detectorMethods, NUM_ARRAY_ELEMENTS(detectorMethods)) < 0) {
+		env->ExceptionClear();
+		LOGW("register_plugin: failed to register nativeUsbReset on DeviceDetectorFragment");
+		// Non-fatal — USB reset is a recovery feature, not critical path.
 	}
 
 	RETURN(0, int);

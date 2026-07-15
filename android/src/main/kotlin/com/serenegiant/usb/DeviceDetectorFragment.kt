@@ -272,12 +272,65 @@ class DeviceDetectorFragment constructor() : Fragment() {
 	}
 
 	//--------------------------------------------------------------------------------
+	// ── USB bus reset (USBDEVFS_RESET ioctl) ─────────────────────────────
+	// BUG-22: When the USB hub power-droops and restores, the MS210x
+	// re-enumerates with corrupted USB descriptors (product="", name="\x01",
+	// vid=0x534d0200).  The Dart-side gate (video_grab_manager.dart) catches
+	// this and waits for clean re-enumeration, but the device never recovers
+	// on its own — the USB host controller keeps the corrupted descriptors
+	// cached until a proper USB bus reset forces the device to re-enumerate
+	// from scratch.
+	//
+	// USBDEVFS_RESET (ioctl _IO('U', 20)) tells the kernel to issue a USB
+	// reset on the device's port, which forces the device to re-enumerate
+	// with clean descriptors.  This is the same mechanism the OS uses when
+	// you physically replug a device.
+	//
+	// The actual ioctl is performed by nativeUsbReset() in
+	// flutter_plugin_main.cpp (registered as a JNI native method on this
+	// class at JNI_OnLoad time).
+	//
+	// We call this before addDevice() in rescanConnectedDevices() when a
+	// device is not yet tracked in mConnectors (i.e. it was previously
+	// rejected by the Dart-side garbled-descriptor gate or addDevice failed).
+	private external fun nativeUsbReset(devicePath: String): Int
+
+	private fun resetUsbDevice(device: UsbDevice): Boolean {
+		val deviceName = device.deviceName  // e.g. "/dev/bus/usb/001/010"
+		if (deviceName.isNullOrEmpty()) return false
+
+		return try {
+			val ret = nativeUsbReset(deviceName)
+			if (ret == 0) {
+				Log.i(TAG, "resetUsbDevice: USBDEVFS_RESET succeeded for $deviceName")
+				true
+			} else {
+				Log.w(TAG, "resetUsbDevice: ioctl failed for $deviceName: errno=$ret")
+				false
+			}
+		} catch (e: UnsatisfiedLinkError) {
+			Log.w(TAG, "resetUsbDevice: nativeUsbReset not registered: ${e.message}")
+			false
+		} catch (e: Exception) {
+			Log.w(TAG, "resetUsbDevice: failed for $deviceName: ${e.message}")
+			false
+		}
+	}
+
+	//--------------------------------------------------------------------------------
 	/**
 	 * Re-scans all currently connected USB devices and attempts to add any that
 	 * aren't already in mConnectors.  Called externally (via MethodChannel) when
 	 * Dart detects that no camera is visible despite the USB bus being active —
 	 * typically because the initial addDevice() attempt failed due to a slow
 	 * enumeration on a long cable or hub power droop.
+	 *
+	 * BUG-22: When a device is not in mConnectors (previously failed addDevice
+	 * or rejected by the Dart-side garbled-descriptor gate), we issue a
+	 * USBDEVFS_RESET ioctl before re-adding it.  This forces the USB host
+	 * controller to re-enumerate the device from scratch, clearing any
+	 * corrupted descriptors from a hub power droop.  After the reset, we
+	 * wait 500 ms for re-enumeration before calling addDevice().
 	 *
 	 * Safe to call at any time; runs on the calling thread (main thread via the
 	 * UVCManager MethodChannel handler).  Acquires mConnectors lock internally.
@@ -293,6 +346,11 @@ class DeviceDetectorFragment constructor() : Fragment() {
 			for (device in monitor.deviceList.toList()) {
 				if (!mConnectors.containsKey(device)) {
 					if (DEBUG) Log.v(TAG, "rescanConnectedDevices: re-adding device: ${device.deviceName}")
+					// BUG-22: Issue a USB bus reset before addDevice() to force
+					// clean re-enumeration if descriptors were garbled by a hub
+					// power droop.  The reset is a no-op if the device is already
+					// in a clean state.
+					resetUsbDevice(device)
 					if (monitor.hasPermission(device)) {
 						addDevice(device)
 					} else {
@@ -391,6 +449,24 @@ class DeviceDetectorFragment constructor() : Fragment() {
 
 	/**
 	 * native側から登録解除する
+	 *
+	 * BUG-21 (fdsan SIGABRT via Parcel-owned FD on rapid detach):
+	 *
+	 * When all USB devices detach simultaneously (e.g. car ignition off),
+	 * the UsbDetector async thread fires onDetach() for each device in rapid
+	 * succession.  nativeRemove(name) returns the FD to the native C++ side
+	 * for cleanup, but the native Parcel that wrapped the FD may not have
+	 * fully released ownership yet.  If we call UsbConnector.close()
+	 * immediately after nativeRemove(), the close() races with the Parcel
+	 * cleanup → fdsan detects "attempted to close file descriptor N, expected
+	 * to be unowned, actually owned by Parcel" → SIGABRT.
+	 *
+	 * Fix: post the UsbConnector.close() + graveyard retention to the async
+	 * handler with a 150 ms delay, giving the native C++ layer time to fully
+	 * release the FD from its Parcel before the Java side closes it.  The
+	 * connector is removed from mConnectors immediately so no new operations
+	 * can target it, but the actual close() is deferred.
+	 *
 	 * @param device
 	 */
 	private fun removeDevice(device: UsbDevice) {
@@ -399,19 +475,44 @@ class DeviceDetectorFragment constructor() : Fragment() {
 		synchronized(mConnectors) {
 			if (mConnectors.containsKey(device)) {
 				val removed = mConnectors.remove(device)
-				removed?.close()
-				// Retain a strong reference in the process-lifetime graveyard so
-				// the GC finalizer (UsbConnector.finalize) cannot run and
-				// double-close the already-closed FD — fdsan SIGABRT.
 				if (removed != null) {
-					retainClosedConnector(
-						removed,
-						reason = "removeDevice normal detach",
-						deviceName = device.deviceName
-					)
-					// Also keep in instance graveyard for backward compat.
-					synchronized(mClosedConnectorGraveyard) {
-						mClosedConnectorGraveyard.add(removed)
+					// Post the actual close() to the async handler with a delay
+					// so the native Parcel can release FD ownership first.
+					val handler = mAsyncHandler
+					if (handler != null) {
+						handler.postDelayed({
+							try {
+								removed.close()
+							} catch (e: Exception) {
+								Log.w(TAG, "removeDevice: deferred close threw: ${e.message}")
+							}
+							// Retain in process-lifetime graveyard so the GC
+							// finalizer cannot double-close the FD.
+							retainClosedConnector(
+								removed,
+								reason = "removeDevice deferred close",
+								deviceName = device.deviceName
+							)
+							synchronized(mClosedConnectorGraveyard) {
+								mClosedConnectorGraveyard.add(removed)
+							}
+						}, 150L)
+					} else {
+						// No async handler (fragment being destroyed) — close
+						// immediately as a fallback.  This is the old path that
+						// could crash, but it only fires during fragment teardown
+						// where the process is likely exiting anyway.
+						try { removed.close() } catch (e: Exception) {
+							Log.w(TAG, "removeDevice: immediate close threw: ${e.message}")
+						}
+						retainClosedConnector(
+							removed,
+							reason = "removeDevice immediate close (no handler)",
+							deviceName = device.deviceName
+						)
+						synchronized(mClosedConnectorGraveyard) {
+							mClosedConnectorGraveyard.add(removed)
+						}
 					}
 				}
 			}
