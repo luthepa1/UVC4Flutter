@@ -70,6 +70,7 @@ class DeviceDetectorFragment constructor() : Fragment() {
 	// open/close cycles; once full, the oldest entry is released (its FD is
 	// long-closed by now, and the OS will have moved on to new FDs).
 	private val mClosedConnectorGraveyard: MutableList<UsbConnector> = mutableListOf()
+	private var mPendingCloseCount: Int = 0 // BUG-21b: staggered close delay counter
 
 	companion object {
 		private const val TAG = "DeviceDetectorFragment"
@@ -359,9 +360,152 @@ class DeviceDetectorFragment constructor() : Fragment() {
 						monitor.requestPermission(device)
 					}
 				} else {
-					if (DEBUG) Log.v(TAG, "rescanConnectedDevices: already tracked: ${device.deviceName}")
+					// BUG-23: Device IS tracked in mConnectors, but its USB
+					// descriptors may have been garbled by a hub power droop
+					// AFTER it was originally added.  The Dart-side gate keeps
+					// it in "re-enumerating" state, but the native side never
+					// recovers because this branch just skips it.  Detect
+					// garbled descriptors and force a reset + re-add.
+					if (isDescriptorGarbled(device)) {
+						Log.w(TAG, "rescanConnectedDevices: tracked device ${device.deviceName} has garbled descriptors — forcing reset + re-add")
+						removeDevice(device)
+						resetUsbDevice(device)
+						// Wait 500ms for the USB bus reset to take effect,
+						// then re-add the device with (hopefully) clean descriptors.
+						val handler = mAsyncHandler
+						if (handler != null) {
+							handler.postDelayed({
+								if (mUSBMonitor != null && mUSBMonitor!!.hasPermission(device)) {
+									addDevice(device)
+								}
+							}, 500L)
+						}
+					} else {
+						if (DEBUG) Log.v(TAG, "rescanConnectedDevices: already tracked: ${device.deviceName}")
+					}
 				}
 			}
+		}
+	}
+
+	/// Detect garbled USB descriptors (same heuristic as the Dart-side gate in
+	/// video_grab_manager.dart).  VID/PID > 0xFFFF or empty product + short
+	/// device name indicates the USB host controller has cached corrupted
+	/// descriptors from a hub power droop.
+	private fun isDescriptorGarbled(device: UsbDevice): Boolean {
+		return device.vendorId > 0xFFFF ||
+			device.productId > 0xFFFF ||
+			(device.productName.isNullOrEmpty() && device.deviceName.length < 4)
+	}
+
+	//--------------------------------------------------------------------------------
+	// ── BUG-23: Force reset by device path ──────────────────────────────────
+	// Called from the Dart side when the re-enumeration watchdog detects a
+	// device has been stuck with garbled descriptors for >10 seconds.  The
+	// Dart side knows the descriptors are garbled (FFI getDeviceInfo), but
+	// the Kotlin UsbDevice object still has the original clean cached values.
+	// This method finds the UsbDevice by its device path (e.g.
+	// /dev/bus/usb/001/015), issues a USBDEVFS_RESET, removes it from
+	// mConnectors, and re-adds it after 500ms.
+	fun forceResetDeviceByPath(devicePath: String) {
+		Log.i(TAG, "forceResetDeviceByPath: $devicePath")
+		val monitor = mUSBMonitor ?: run {
+			Log.w(TAG, "forceResetDeviceByPath: no USBMonitor")
+			return
+		}
+		if (!monitor.isRegistered) {
+			Log.w(TAG, "forceResetDeviceByPath: USBMonitor not registered")
+			return
+		}
+
+		// Find the UsbDevice matching the path.  Android's UsbDevice.deviceName
+		// is the /dev/bus/usb/NNN/NNN path.
+		val target: UsbDevice? = monitor.deviceList.toList().find {
+			it.deviceName == devicePath
+		}
+		if (target == null) {
+			Log.w(TAG, "forceResetDeviceByPath: no device found at path $devicePath")
+			return
+		}
+
+		Log.i(TAG, "forceResetDeviceByPath: found device ${target.deviceName}, removing + resetting + re-adding")
+		synchronized(mConnectors) {
+			// Remove from mConnectors and close the connector.
+			removeDevice(target)
+		}
+		// Issue USB bus reset to force clean re-enumeration.
+		resetUsbDevice(target)
+		// Wait 500ms for the reset to take effect, then re-add.
+		val handler = mAsyncHandler
+		if (handler != null) {
+			handler.postDelayed({
+				if (mUSBMonitor != null && mUSBMonitor!!.hasPermission(target)) {
+					addDevice(target)
+				} else if (mUSBMonitor != null) {
+					// Permission may have been lost — re-request.
+					bringToForeground()
+					exitImmersiveMode()
+					mUSBMonitor!!.requestPermission(target)
+				}
+			}, 500L)
+		} else {
+			// No async handler — try re-add immediately.
+			if (monitor.hasPermission(target)) {
+				addDevice(target)
+			}
+		}
+	}
+
+	//--------------------------------------------------------------------------------
+	// ── BUG-23 fallback: Force reset all UVC devices ──────────────────────
+	// Called when the Dart side cannot provide a valid USB device path
+	// (because the FFI getDeviceInfo() returned garbled descriptors with
+	// a corrupted name field like "\x01").  This method iterates all
+	// devices in the USBMonitor and resets any that match known UVC
+	// VID/PIDs (MS210x 0x534D:0x2109) or that are already tracked in
+	// mConnectors (could be garbled).
+	fun forceResetAllUvcDevices() {
+		Log.i(TAG, "forceResetAllUvcDevices: resetting all UVC devices")
+		val monitor = mUSBMonitor ?: run {
+			Log.w(TAG, "forceResetAllUvcDevices: no USBMonitor")
+			return
+		}
+		if (!monitor.isRegistered) {
+			Log.w(TAG, "forceResetAllUvcDevices: USBMonitor not registered")
+			return
+		}
+
+		// Known UVC video grabber VID:PIDs
+		val uvcVidPids = setOf(
+			Pair(0x534D, 0x2109),  // MS210x
+		)
+
+		var resetCount = 0
+		synchronized(mConnectors) {
+			for (device in monitor.deviceList.toList()) {
+				val isUvc = uvcVidPids.contains(Pair(device.vendorId, device.productId))
+				val isTracked = mConnectors.containsKey(device)
+				// Reset if: it's a known UVC device, OR it's tracked (could be garbled)
+				if (isUvc || isTracked) {
+					Log.i(TAG, "forceResetAllUvcDevices: resetting ${device.deviceName} " +
+						"(vid=0x${device.vendorId.toString(16)}, pid=0x${device.productId.toString(16)}, tracked=$isTracked)")
+					removeDevice(device)
+					resetUsbDevice(device)
+					resetCount++
+					// Re-add after 500ms
+					val handler = mAsyncHandler
+					if (handler != null) {
+						handler.postDelayed({
+							if (mUSBMonitor != null && mUSBMonitor!!.hasPermission(device)) {
+								addDevice(device)
+							}
+						}, 500L)
+					}
+				}
+			}
+		}
+		if (resetCount == 0) {
+			Log.w(TAG, "forceResetAllUvcDevices: no UVC devices found to reset")
 		}
 	}
 
@@ -462,10 +606,18 @@ class DeviceDetectorFragment constructor() : Fragment() {
 	 * to be unowned, actually owned by Parcel" → SIGABRT.
 	 *
 	 * Fix: post the UsbConnector.close() + graveyard retention to the async
-	 * handler with a 150 ms delay, giving the native C++ layer time to fully
+	 * handler with a staggered delay, giving the native C++ layer time to fully
 	 * release the FD from its Parcel before the Java side closes it.  The
 	 * connector is removed from mConnectors immediately so no new operations
 	 * can target it, but the actual close() is deferred.
+	 *
+	 * BUG-21b: When ALL USB devices detach simultaneously (car ignition off),
+	 * multiple removeDevice() calls fire within milliseconds.  Each schedules
+	 * a 150ms delayed close, but they all fire at roughly the same time.  The
+	 * native C++ layer processes FD releases sequentially, so by the time the
+	 * later closes fire, the FDs may have been claimed by unique_fd on the
+	 * native side.  Fix: use a longer base delay (300ms) and stagger each
+	 * additional close by 100ms so they don't all fire at once.
 	 *
 	 * @param device
 	 */
@@ -478,8 +630,15 @@ class DeviceDetectorFragment constructor() : Fragment() {
 				if (removed != null) {
 					// Post the actual close() to the async handler with a delay
 					// so the native Parcel can release FD ownership first.
+					// BUG-21b: Use a staggered delay — 300ms base + 100ms per
+					// pending close — so simultaneous multi-device detach
+					// (ignition off) doesn't fire all closes at once.
 					val handler = mAsyncHandler
 					if (handler != null) {
+						synchronized(mClosedConnectorGraveyard) {
+							mPendingCloseCount++
+						}
+						val closeDelay = 300L + (mPendingCloseCount - 1) * 100L
 						handler.postDelayed({
 							try {
 								removed.close()
@@ -495,8 +654,9 @@ class DeviceDetectorFragment constructor() : Fragment() {
 							)
 							synchronized(mClosedConnectorGraveyard) {
 								mClosedConnectorGraveyard.add(removed)
+								mPendingCloseCount--
 							}
-						}, 150L)
+						}, closeDelay)
 					} else {
 						// No async handler (fragment being destroyed) — close
 						// immediately as a fallback.  This is the old path that

@@ -258,6 +258,44 @@ class DeviceDetector private constructor() {
 			}
 		}
 
+		/// BUG-23: Force-reset a UVC device that is stuck with garbled descriptors.
+		/// Called from the Dart side via UVCManager MethodChannel when the
+		/// re-enumeration watchdog detects the device has been stuck for >10s.
+		/// The Dart side knows the descriptors are garbled (via FFI getDeviceInfo)
+		/// but the Kotlin UsbDevice object still has the original clean cached
+		/// values, so rescanConnectedDevices() can't detect it — this method
+		/// bypasses the descriptor check and forces a remove + USBDEVFS_RESET +
+		/// re-add cycle on the specified device path.
+		@Suppress("deprecation")
+		@Keep
+		fun forceResetUvcDevice(activity: Activity, devicePath: String) {
+			if (DEBUG) Log.v(TAG, "forceResetUvcDevice: $devicePath")
+			val fm = activity.getFragmentManager()
+			val detector = fm.findFragmentByTag(DeviceDetectorFragment::class.java.name)
+			if (detector is DeviceDetectorFragment) {
+				detector.forceResetDeviceByPath(devicePath)
+			} else {
+				Log.w(TAG, "forceResetUvcDevice: DeviceDetectorFragment not found")
+			}
+		}
+
+		/// BUG-23 fallback: Force-reset all UVC devices when the Dart side cannot
+			/// provide a valid device path (garbled FFI descriptors).  Iterates all
+			/// USB devices and resets any matching known UVC VID/PIDs or already
+			/// tracked devices.
+			@Suppress("deprecation")
+			@Keep
+			fun forceResetAllUvcDevices(activity: Activity) {
+				if (DEBUG) Log.v(TAG, "forceResetAllUvcDevices:")
+				val fm = activity.getFragmentManager()
+				val detector = fm.findFragmentByTag(DeviceDetectorFragment::class.java.name)
+				if (detector is DeviceDetectorFragment) {
+					detector.forceResetAllUvcDevices()
+				} else {
+					Log.w(TAG, "forceResetAllUvcDevices: DeviceDetectorFragment not found")
+				}
+			}
+
 		/**
 		 * DeviceDetectorを解放する
 		 * @param activity

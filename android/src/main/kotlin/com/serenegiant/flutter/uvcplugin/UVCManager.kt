@@ -65,12 +65,20 @@ class UVCManager: FlutterPlugin, MethodCallHandler, ActivityAware {
   override fun onAttachedToActivity(binding: ActivityPluginBinding) {
     if (DEBUG) Log.v(TAG, "onAttachedToActivity:")
     mActivity = WeakReference(binding.activity)
-    if (mNeedInitialize) {
-      mNeedInitialize = false
-      // 多分無いと思うけどメソッドコールからの"initialize"が先に来てしまったとき
-      if (DEBUG) Log.v(TAG, "onAttachedToActivity:initUVCDeviceDetector")
-      DeviceDetector.initUVCDeviceDetector(binding.activity)
-    }
+    mNeedInitialize = false
+    // Always (re-)initialize the DeviceDetectorFragment on activity re-attach.
+    // onDetachedFromActivity calls releaseDeviceDetector() which REMOVES the
+    // fragment from the FragmentManager.  Previously, initUVCDeviceDetector()
+    // was only called when mNeedInitialize was true (the race-condition path
+    // where the Dart "initialize" method call arrived before the activity).
+    // But in the normal app lifecycle (background → foreground), mNeedInitialize
+    // was set to false on detach, so the fragment was never re-added — causing
+    // rescanUvcDevices() / forceResetUvcDevice() to permanently fail with
+    // "DeviceDetectorFragment not found" after every app resume.
+    // initUVCDeviceDetector() is idempotent: it checks if the fragment already
+    // exists before creating one, so calling it unconditionally is safe.
+    if (DEBUG) Log.v(TAG, "onAttachedToActivity:initUVCDeviceDetector")
+    DeviceDetector.initUVCDeviceDetector(binding.activity)
   }
 
   override fun onDetachedFromActivityForConfigChanges() {
@@ -117,6 +125,47 @@ class UVCManager: FlutterPlugin, MethodCallHandler, ActivityAware {
           result.success(null)
         } else {
           result.error("No Activity", "Activity not available for rescan", null)
+        }
+      }
+      "forceResetDevice" -> {
+        // BUG-23: Called by Dart when a device is stuck in re-enumerating state
+        // with garbled descriptors.  The Dart side detects the garbled state
+        // via FFI getDeviceInfo(), but the native UsbDevice object still holds
+        // the original clean descriptors (Android caches them at first enum).
+        // This method forces a remove + USBDEVFS_RESET + re-add cycle on the
+        // native side regardless of what UsbDevice reports.
+        val devicePath = call.argument<String>("devicePath")
+        if (devicePath != null) {
+          if (DEBUG) Log.v(TAG, "onMethodCall#forceResetDevice: $devicePath")
+          val a = mActivity.get()
+          if (a != null) {
+            // BUG-23 fix: If the device path is not a valid /dev/bus/usb/ path
+            // (garbled FFI returned "\x01"), use the fallback that resets all
+            // UVC devices instead of failing silently.
+            if (devicePath.startsWith("/dev/bus/usb/")) {
+              DeviceDetector.forceResetUvcDevice(a, devicePath)
+            } else {
+              Log.w(TAG, "onMethodCall#forceResetDevice: invalid path '$devicePath' — using forceResetAllUvcDevices fallback")
+              DeviceDetector.forceResetAllUvcDevices(a)
+            }
+            result.success(null)
+          } else {
+            result.error("No Activity", "Activity not available for forceReset", null)
+          }
+        } else {
+          result.error("missing devicePath", null, null)
+        }
+      }
+      "forceResetAllUvcDevices" -> {
+        // BUG-23 fallback: Reset all UVC devices when the Dart side cannot
+        // identify a specific device by path.
+        val a = mActivity.get()
+        if (a != null) {
+          if (DEBUG) Log.v(TAG, "onMethodCall#forceResetAllUvcDevices")
+          DeviceDetector.forceResetAllUvcDevices(a)
+          result.success(null)
+        } else {
+          result.error("No Activity", "Activity not available for forceResetAll", null)
         }
       }
       "createTexture" -> {

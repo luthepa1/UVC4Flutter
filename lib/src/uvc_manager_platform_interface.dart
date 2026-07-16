@@ -157,4 +157,24 @@ abstract class UVCManagerPlatform extends PlatformInterface {
     throw UnimplementedError('rescanDevices() has not been implemented.');
   }
 
+  /// BUG-23: Force-reset a specific UVC device by its USB device path.
+  ///
+  /// Called by the Dart-side re-enumeration watchdog when a device has been
+  /// stuck with garbled descriptors for >10 seconds.  The native side will:
+  /// 1. Remove the device from mConnectors (close the USB connector)
+  /// 2. Issue a USBDEVFS_RESET ioctl on the device's USB port
+  /// 3. Wait 500ms for clean re-enumeration
+  /// 4. Re-add the device via addDevice()
+  ///
+  /// [devicePath] is the Android USB device node path (e.g. /dev/bus/usb/001/015).
+  Future<void> forceResetDevice(String devicePath) async {
+    throw UnimplementedError('forceResetDevice() has not been implemented.');
+  }
+
+  /// BUG-23 fallback: Force-reset all UVC devices.  Used when the device
+  /// path is unknown or garbled (FFI returned corrupted descriptors).
+  Future<void> forceResetAllUvcDevices() async {
+    throw UnimplementedError('forceResetAllUvcDevices() has not been implemented.');
+  }
+
 }

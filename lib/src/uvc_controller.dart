@@ -584,6 +584,30 @@ class UVCManager with ChangeNotifier, WidgetsBindingObserver implements UVCManag
     }
   }
 
+  /// BUG-23: Force-reset a specific UVC device by its USB device path.
+  /// See [UVCManagerPlatform.forceResetDevice] for documentation.
+  @override
+  Future<void> forceResetDevice(String devicePath) async {
+    if (_debug) _logger.d("UVCManager#forceResetDevice: $devicePath");
+    try {
+      await _channel.invokeMethod('forceResetDevice', {'devicePath': devicePath});
+    } catch (e) {
+      _logger.w("UVCManager#forceResetDevice: error: $e");
+    }
+  }
+
+  /// BUG-23 fallback: Force-reset all UVC devices.  Used when the device
+  /// path is unknown or garbled (FFI returned corrupted descriptors).
+  @override
+  Future<void> forceResetAllUvcDevices() async {
+    if (_debug) _logger.d("UVCManager#forceResetAllUvcDevices");
+    try {
+      await _channel.invokeMethod('forceResetAllUvcDevices');
+    } catch (e) {
+      _logger.w("UVCManager#forceResetAllUvcDevices: error: $e");
+    }
+  }
+
   /// USB機器の接続状態が変化したときの処理
   void _handleOnDeviceChanged(int deviceId, bool attached) {
     if (_debug) _logger.d('UVCManager#onDeviceChanged:deviceId=$deviceId,attached=$attached');
