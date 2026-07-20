@@ -400,6 +400,98 @@ static jint nativeUsbReset(JNIEnv *env, jobject, jstring devicePath) {
 }
 
 //================================================================================
+// BUG-34: native USB bus reset via USBDEVFS_RESET ioctl using a framework-provided FD.
+// On Android 16, SELinux blocks untrusted apps from directly opening
+// /dev/bus/usb/NNN/NNN (avc: denied { search } for name="usb" tclass=dir).
+// The app has USB permission through the Android framework (UsbManager), but
+// that doesn't grant raw file access.  This variant accepts a file descriptor
+// obtained via UsbManager.openDevice() / USBMonitor.openDevice() instead of
+// opening the raw device path.  Returns 0 on success, negative errno on failure.
+// Does NOT close the FD — the caller owns the connection lifecycle.
+static jint nativeUsbResetFd(JNIEnv *env, jobject, jint fd) {
+	ENTER();
+
+	if (fd < 0) {
+		LOGW("nativeUsbResetFd: invalid fd=%d", fd);
+		RETURN(-EINVAL, jint);
+	}
+
+	int ret = ioctl(fd, USBDEVFS_RESET);
+	if (ret < 0) {
+		LOGW("nativeUsbResetFd: ioctl USBDEVFS_RESET failed: %s", strerror(errno));
+		ret = -errno;
+	} else {
+		LOGI("nativeUsbResetFd: USBDEVFS_RESET succeeded (fd=%d)", fd);
+	}
+
+	RETURN(ret, jint);
+}
+
+//================================================================================
+// BUG-36 fix: nativeSetDeviceInfo — pass Android UsbDevice descriptor info to C++.
+// Called from Kotlin DeviceDetectorFragment.addDevice() BEFORE nativeAdd, so that
+// get_device_info returns clean Android descriptors instead of garbled libusb ones.
+// Keyed by device path (e.g. "/dev/bus/usb/001/010") since the device_id is
+// generated inside the prebuilt native library and not accessible from Kotlin.
+static jint nativeSetDeviceInfo(JNIEnv *env, jobject,
+		jstring devicePathStr,
+		jint vendorId, jint productId,
+		jint deviceClass, jint deviceSubclass, jint deviceProtocol,
+		jstring manufacturerStr, jstring productStr, jstring serialStr)
+{
+	ENTER();
+
+	const char *devicePath = env->GetStringUTFChars(devicePathStr, nullptr);
+	if (!devicePath) {
+		RETURN(-1, jint);
+	}
+
+	usb_device_info_t info;
+	memset(&info, 0, sizeof(info));
+	info.vendor_id = (uint32_t)vendorId;
+	info.product_id = (uint32_t)productId;
+	info.device_class = (uint8_t)deviceClass;
+	info.device_subclass = (uint8_t)deviceSubclass;
+	info.device_protocol = (uint8_t)deviceProtocol;
+	info.reserved1 = 0;
+	// Store the device path in the name field too (for consistency)
+	strncpy(reinterpret_cast<char*>(info.name), devicePath, sizeof(info.name) - 1);
+
+	const char *src;
+	if (manufacturerStr) {
+		src = env->GetStringUTFChars(manufacturerStr, nullptr);
+		if (src) {
+			strncpy(reinterpret_cast<char*>(info.manufacturer_name), src, sizeof(info.manufacturer_name) - 1);
+			env->ReleaseStringUTFChars(manufacturerStr, src);
+		}
+	}
+	if (productStr) {
+		src = env->GetStringUTFChars(productStr, nullptr);
+		if (src) {
+			strncpy(reinterpret_cast<char*>(info.product_name), src, sizeof(info.product_name) - 1);
+			env->ReleaseStringUTFChars(productStr, src);
+		}
+	}
+	if (serialStr) {
+		src = env->GetStringUTFChars(serialStr, nullptr);
+		if (src) {
+			strncpy(reinterpret_cast<char*>(info.serial), src, sizeof(info.serial) - 1);
+			env->ReleaseStringUTFChars(serialStr, src);
+		}
+	}
+
+	int32_t result = -1;
+	std::lock_guard<std::mutex> lock(plugin_lock);
+	if (pluginJava) {
+		pluginJava->set_device_info(std::string(devicePath), info);
+		result = 0;
+	}
+
+	env->ReleaseStringUTFChars(devicePathStr, devicePath);
+	RETURN(result, jint);
+}
+
+//================================================================================
 static JNINativeMethod methods[] = {
 	{ "nativeInit",	"()I", (void *) nativeInit },
 	{ "nativeRelease",	"()I", (void *) nativeRelease },
@@ -408,8 +500,13 @@ static JNINativeMethod methods[] = {
 };
 
 // Native methods registered on DeviceDetectorFragment for USB bus reset.
+// BUG-36: nativeSetDeviceInfo added to pass Android UsbDevice descriptors.
 static JNINativeMethod detectorMethods[] = {
 	{ "nativeUsbReset",	"(Ljava/lang/String;)I", (void *) nativeUsbReset },
+	{ "nativeUsbResetFd",	"(I)I", (void *) nativeUsbResetFd },
+	{ "nativeSetDeviceInfo",
+		"(Ljava/lang/String;IIIIILjava/lang/String;Ljava/lang/String;Ljava/lang/String;)I",
+		(void *) nativeSetDeviceInfo },
 };
 
 

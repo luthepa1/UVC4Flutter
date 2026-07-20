@@ -22,7 +22,10 @@
 #include <mutex>
 #include <memory>
 #include <unordered_map>
+#include <deque>
+#include <string>
 #include <jni.h>
+#include "aandusb/aandusb_native.h"
 
 //--------------------------------------------------------------------------------
 // 外部クラスの前方宣言
@@ -46,6 +49,37 @@ private:
 	 * UVC機器のidとUVCHolderSpのペアを保持
 	 */
 	std::unordered_map <int32_t, std::shared_ptr<FlutterUVCHolder>> holders;
+	/**
+	 * BUG-36 fix: Cache of Android UsbDevice descriptor info keyed by device
+	 * path (e.g. "/dev/bus/usb/001/010").  The prebuilt usb_get_device_info
+	 * reads from the libusb Device object, which returns garbled descriptors
+	 * after a hub power-cycle/replug.  The Android UsbDevice object always
+	 * has clean descriptors (from the kernel's USB enumeration), so we cache
+	 * them here and use them to override garbled fields in get_device_info.
+	 */
+	std::unordered_map<std::string, usb_device_info_t> android_device_info_cache;
+	/**
+	 * Canonical mapping of runtime native device_id -> stable Android device path
+	 * (/dev/bus/usb/BBB/DDD). This lets get_device_info look up Android-side
+	 * cached metadata without trusting libusb's potentially garbled name field.
+	 */
+	std::unordered_map<int32_t, std::string> device_path_by_id;
+	/**
+	 * Queue of recently seen Android device paths (from nativeSetDeviceInfo)
+	 * that have not yet been bound to a runtime native device_id.
+	 */
+	std::deque<std::string> pending_device_paths;
+
+	/**
+	 * Bind runtime device_id to canonical Android device path.
+	 * Caller must hold m_lock.
+	 */
+	void bind_device_path_locked(const int32_t &device_id, const std::string &device_path);
+	/**
+	 * Resolve canonical Android device path for runtime device_id.
+	 * Caller must hold m_lock.
+	 */
+	std::string resolve_device_path_locked(const int32_t &device_id);
 
 	/**
 	 * 使用中のＵＶＣ機器があれば終了させる
@@ -110,6 +144,13 @@ public:
 	 * @return
 	 */
 	usb_device_info_t get_device_info(const int32_t &device_id);
+	/**
+	 * BUG-36 fix: Cache Android UsbDevice descriptor info for a device.
+	 * Called from Kotlin (via JNI nativeSetDeviceInfo) before nativeAdd,
+	 * so that get_device_info returns clean Android descriptors instead
+	 * of garbled libusb descriptors after a hub power-cycle.
+	 */
+	void set_device_info(const std::string &device_path, const usb_device_info_t &info);
 	/**
 	 * 映像取得開始
 	 * レンダーコールバックを呼び出さないと実際には描画されない

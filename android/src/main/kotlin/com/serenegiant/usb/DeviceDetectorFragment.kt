@@ -71,10 +71,15 @@ class DeviceDetectorFragment constructor() : Fragment() {
 	// long-closed by now, and the OS will have moved on to new FDs).
 	private val mClosedConnectorGraveyard: MutableList<UsbConnector> = mutableListOf()
 	private var mPendingCloseCount: Int = 0 // BUG-21b: staggered close delay counter
+	// BUG-43: Debounce reset/re-add storms for the same USB path.
+	// Key = UsbDevice.deviceName (/dev/bus/usb/NNN/NNN)
+	private val mLastResetByPathMs: MutableMap<String, Long> = HashMap()
+	private val mResetInFlightPaths: MutableSet<String> = HashSet()
 
 	companion object {
 		private const val TAG = "DeviceDetectorFragment"
-		private const val DEBUG = false
+		private const val DEBUG = true
+		private const val RESET_READD_COOLDOWN_MS = 10_000L
 
 		// Process-lifetime graveyard for closed UsbConnector objects.
 		// See the comment on mClosedConnectorGraveyard above for the full
@@ -195,20 +200,43 @@ class DeviceDetectorFragment constructor() : Fragment() {
 			// devices via removeDevice(), we must re-add them here or the camera
 			// will never recover after app backgrounding (e.g. switching to Spotify
 			// and back, screen lock, etc.).
-			synchronized(mConnectors) {
-				for (device in mUSBMonitor!!.deviceList.toList()) {
-					if (!mConnectors.containsKey(device)) {
-						if (DEBUG) Log.v(TAG, "onStart:re-scanning already-attached device:" + device.deviceName)
-						if (mUSBMonitor!!.hasPermission(device)) {
-							addDevice(device)
-						} else {
-							// Permission was lost (rare but possible) — re-request.
-							bringToForeground()
-							exitImmersiveMode()
-							mUSBMonitor!!.requestPermission(device)
+			// BUG-31/36/41: After a USB hub power-cycle, the MS210x may still be mid-
+			// enumeration when we reach onStart().  Delay the re-scan by 4s to give
+			// the USB bus time to stabilize.
+			//
+			// BUG-41 (2026-07-19): The previous BUG-36 fix always issued a
+			// USBDEVFS_RESET before addDevice.  But when the device starts clean
+			// (fresh hub plug), the reset DESTROYS the kernel's USB transfer buffer
+			// allocation.  The re-enumerated device can't handle SETINTERFACE
+			// (ENOMEM / errno 12) → "Failed to start stream,err=-99" → black screen.
+			//
+			// Fix: try addDevice FIRST without reset.  Only reset if the claim
+			// fails (the addDevice IOException retry path handles this).  This
+			// preserves the working kernel state for clean devices while still
+			// recovering broken devices via the retry mechanism.
+			val handler = mAsyncHandler
+			if (handler != null) {
+				handler.postDelayed({
+					if (mUSBMonitor == null) return@postDelayed
+					synchronized(mConnectors) {
+						for (device in mUSBMonitor!!.deviceList.toList()) {
+							if (!mConnectors.containsKey(device)) {
+								if (DEBUG) Log.v(TAG, "onStart:re-scanning already-attached device:" + device.deviceName)
+								if (mUSBMonitor!!.hasPermission(device)) {
+									// BUG-41: Try addDevice directly first — no reset.
+									// The addDevice IOException retry path will call
+									// resetAndReAddDevice if the claim fails.
+									addDevice(device)
+								} else {
+									// Permission was lost (rare but possible) — re-request.
+									bringToForeground()
+									exitImmersiveMode()
+									mUSBMonitor!!.requestPermission(device)
+								}
+							}
 						}
 					}
-				}
+				}, 4000L)
 			}
 		}
 	}
@@ -296,11 +324,74 @@ class DeviceDetectorFragment constructor() : Fragment() {
 	// rejected by the Dart-side garbled-descriptor gate or addDevice failed).
 	private external fun nativeUsbReset(devicePath: String): Int
 
+	// BUG-34: FD-based variant of nativeUsbReset.  On Android 16, SELinux blocks
+	// direct open() on /dev/bus/usb/* for untrusted apps.  This variant accepts
+	// a file descriptor obtained via USBMonitor.openDevice() (which goes through
+	// the framework's UsbManager.openDevice()).  Does NOT close the FD — the
+	// caller owns the connection lifecycle.
+	private external fun nativeUsbResetFd(fd: Int): Int
+
+	// BUG-36: Pass Android UsbDevice descriptor info to the native C++ layer
+	// so that get_device_info returns clean Android descriptors instead of
+	// garbled libusb descriptors after a hub power-cycle.
+	private external fun nativeSetDeviceInfo(
+		devicePath: String,
+		vendorId: Int, productId: Int,
+		deviceClass: Int, deviceSubclass: Int, deviceProtocol: Int,
+		manufacturer: String?, product: String?, serial: String?
+	): Int
+
 	private fun resetUsbDevice(device: UsbDevice): Boolean {
 		val deviceName = device.deviceName  // e.g. "/dev/bus/usb/001/010"
 		if (deviceName.isNullOrEmpty()) return false
 
 		return try {
+			// BUG-34: Try the FD-based approach first.  On Android 16, SELinux
+			// blocks direct open() on /dev/bus/usb/* for untrusted apps (avc:
+			// denied { search } for name="usb" tclass=dir).  We open the device
+			// via the framework's UsbManager.openDevice() (through USBMonitor)
+			// which grants us a valid FD we can use for the USBDEVFS_RESET ioctl.
+			// The connection is closed after the reset to avoid leaking FDs.
+			val monitor = mUSBMonitor
+			if (monitor != null && monitor.hasPermission(device)) {
+				var connector: UsbConnector? = null
+				try {
+					connector = monitor.openDevice(device)
+					val fd = connector.fileDescriptor
+					if (fd >= 0) {
+						val ret = nativeUsbResetFd(fd)
+						if (ret == 0) {
+							Log.i(TAG, "resetUsbDevice: USBDEVFS_RESET succeeded for $deviceName (fd=$fd)")
+							return true
+						} else {
+							Log.w(TAG, "resetUsbDevice: nativeUsbResetFd failed for $deviceName: errno=$ret")
+						}
+					} else {
+						Log.w(TAG, "resetUsbDevice: openDevice returned invalid fd=$fd for $deviceName")
+					}
+				} catch (e: IOException) {
+					Log.w(TAG, "resetUsbDevice: openDevice IOException for $deviceName: ${e.message}")
+				} finally {
+					// Close the connection we opened for the reset.  This is safe
+					// because we did NOT add this connector to mConnectors or pass
+					// it to the native layer — it's a transient connection used
+					// solely for obtaining the FD for the ioctl.
+					if (connector != null) {
+						try { connector.close() } catch (_: Exception) {}
+						// Graveyard the transient connector to prevent its finalizer
+						// from double-closing the FD after we already closed it.
+						retainClosedConnector(
+							connector,
+							reason = "resetUsbDevice transient connection",
+							deviceName = deviceName
+						)
+					}
+				}
+			}
+
+			// Fallback: path-based approach (works on older Android versions
+			// where SELinux doesn't block direct open() on USB device files).
+			Log.i(TAG, "resetUsbDevice: falling back to path-based reset for $deviceName")
 			val ret = nativeUsbReset(deviceName)
 			if (ret == 0) {
 				Log.i(TAG, "resetUsbDevice: USBDEVFS_RESET succeeded for $deviceName")
@@ -310,11 +401,73 @@ class DeviceDetectorFragment constructor() : Fragment() {
 				false
 			}
 		} catch (e: UnsatisfiedLinkError) {
-			Log.w(TAG, "resetUsbDevice: nativeUsbReset not registered: ${e.message}")
+			Log.w(TAG, "resetUsbDevice: native method not registered: ${e.message}")
 			false
 		} catch (e: Exception) {
 			Log.w(TAG, "resetUsbDevice: failed for $deviceName: ${e.message}")
 			false
+		}
+	}
+
+	/**
+	 * BUG-36: Reset the USB device, wait for kernel re-enumeration, refresh the
+	 * device list so we get a fresh FD, then call addDevice.  After a
+	 * USBDEVFS_RESET the old FD is invalidated, so the previously-cached
+	 * UsbDevice/connection can no longer be used to claim the UVC interface
+	 * (LIBUSB_ERROR_NO_DEVICE / err=-4).  Closing the connector, refreshing, and
+	 * re-adding lets libusb open a brand-new FD against the re-enumerated device.
+	 *
+	 * Runs the reset synchronously on the calling thread, then posts the
+	 * refresh+addDevice on the async handler after delayMs.
+	 */
+	private fun resetAndReAddDevice(device: UsbDevice, delayMs: Long) {
+		val path = device.deviceName
+		val nowMs = System.currentTimeMillis()
+		synchronized(mSync) {
+			if (mResetInFlightPaths.contains(path)) {
+				Log.w(TAG, "resetAndReAddDevice: skip in-flight reset for $path")
+				return
+			}
+			val lastMs = mLastResetByPathMs[path]
+			if (lastMs != null && (nowMs - lastMs) < RESET_READD_COOLDOWN_MS) {
+				Log.w(TAG, "resetAndReAddDevice: cooldown active for $path (${nowMs - lastMs}ms < ${RESET_READD_COOLDOWN_MS}ms) — skip")
+				return
+			}
+			mResetInFlightPaths.add(path)
+			mLastResetByPathMs[path] = nowMs
+		}
+
+		Log.i(TAG, "resetAndReAddDevice: $path (delay=${delayMs}ms)")
+		resetUsbDevice(device)
+		val handler = mAsyncHandler
+		if (handler != null) {
+			handler.postDelayed({
+				try {
+					if (mUSBMonitor == null) return@postDelayed
+					try {
+						mUSBMonitor!!.refreshDevices()
+					} catch (e: Exception) {
+						Log.w(TAG, "resetAndReAddDevice: refreshDevices failed: ${e.message}")
+					}
+					if (mUSBMonitor != null && mUSBMonitor!!.hasPermission(device) && !mConnectors.containsKey(device)) {
+						addDevice(device)
+					} else if (mUSBMonitor != null && !mUSBMonitor!!.hasPermission(device)) {
+						bringToForeground()
+						exitImmersiveMode()
+						mUSBMonitor!!.requestPermission(device)
+					}
+				} finally {
+					synchronized(mSync) { mResetInFlightPaths.remove(path) }
+				}
+			}, delayMs)
+		} else {
+			try {
+				if (mUSBMonitor != null && mUSBMonitor!!.hasPermission(device) && !mConnectors.containsKey(device)) {
+					addDevice(device)
+				}
+			} finally {
+				synchronized(mSync) { mResetInFlightPaths.remove(path) }
+			}
 		}
 	}
 
@@ -347,18 +500,12 @@ class DeviceDetectorFragment constructor() : Fragment() {
 			for (device in monitor.deviceList.toList()) {
 				if (!mConnectors.containsKey(device)) {
 					if (DEBUG) Log.v(TAG, "rescanConnectedDevices: re-adding device: ${device.deviceName}")
-					// BUG-22: Issue a USB bus reset before addDevice() to force
-					// clean re-enumeration if descriptors were garbled by a hub
-					// power droop.  The reset is a no-op if the device is already
-					// in a clean state.
-					resetUsbDevice(device)
-					if (monitor.hasPermission(device)) {
-						addDevice(device)
-					} else {
-						bringToForeground()
-						exitImmersiveMode()
-						monitor.requestPermission(device)
-					}
+					// BUG-41/43: Try addDevice first (no prophylactic reset).
+					// addDevice() already has retry logic and only escalates to
+					// resetAndReAddDevice on IOException. Unconditional reset in this
+					// path can create reset storms that lead to SETINTERFACE ENOMEM
+					// and black screen.
+					addDevice(device)
 				} else {
 					// BUG-23: Device IS tracked in mConnectors, but its USB
 					// descriptors may have been garbled by a hub power droop
@@ -369,19 +516,19 @@ class DeviceDetectorFragment constructor() : Fragment() {
 					if (isDescriptorGarbled(device)) {
 						Log.w(TAG, "rescanConnectedDevices: tracked device ${device.deviceName} has garbled descriptors — forcing reset + re-add")
 						removeDevice(device)
-						resetUsbDevice(device)
-						// Wait 500ms for the USB bus reset to take effect,
-						// then re-add the device with (hopefully) clean descriptors.
-						val handler = mAsyncHandler
-						if (handler != null) {
-							handler.postDelayed({
-								if (mUSBMonitor != null && mUSBMonitor!!.hasPermission(device)) {
-									addDevice(device)
-								}
-							}, 500L)
-						}
+						// BUG-36: Use 2s delay for kernel re-enumeration after reset.
+						resetAndReAddDevice(device, 2000L)
 					} else {
 						if (DEBUG) Log.v(TAG, "rescanConnectedDevices: already tracked: ${device.deviceName}")
+						// BUG-30/32: Do NOT call mDeviceDetector.add() to re-notify Dart.
+						// The native DeviceDetector::add() destructs the old DeviceConnector
+						// (closing the FD) before creating a new one, and that close races
+						// with native unique_fd ownership → fdsan SIGABRT.  The
+						// on_device_changed event lost at startup (because
+						// dart_api_message_port was -1) cannot be safely re-sent this way.
+						// The proper fix is to ensure the Dart UVCManager singleton is
+						// constructed before the native addDevice runs, which is handled
+						// by the 2s delay in onStart() + onAttach().
 					}
 				}
 			}
@@ -424,7 +571,8 @@ class DeviceDetectorFragment constructor() : Fragment() {
 			it.deviceName == devicePath
 		}
 		if (target == null) {
-			Log.w(TAG, "forceResetDeviceByPath: no device found at path $devicePath")
+			Log.w(TAG, "forceResetDeviceByPath: no device found at path $devicePath — falling back to forceResetAllUvcDevices")
+			forceResetAllUvcDevices()
 			return
 		}
 
@@ -433,27 +581,10 @@ class DeviceDetectorFragment constructor() : Fragment() {
 			// Remove from mConnectors and close the connector.
 			removeDevice(target)
 		}
-		// Issue USB bus reset to force clean re-enumeration.
-		resetUsbDevice(target)
-		// Wait 500ms for the reset to take effect, then re-add.
-		val handler = mAsyncHandler
-		if (handler != null) {
-			handler.postDelayed({
-				if (mUSBMonitor != null && mUSBMonitor!!.hasPermission(target)) {
-					addDevice(target)
-				} else if (mUSBMonitor != null) {
-					// Permission may have been lost — re-request.
-					bringToForeground()
-					exitImmersiveMode()
-					mUSBMonitor!!.requestPermission(target)
-				}
-			}, 500L)
-		} else {
-			// No async handler — try re-add immediately.
-			if (monitor.hasPermission(target)) {
-				addDevice(target)
-			}
-		}
+		// BUG-36: Reset + refresh + re-add with fresh FD after delay.
+		// (resetAndReAddDevice handles the USBDEVFS_RESET, refreshDevices, and
+		// delayed addDevice; 2s is needed for kernel re-enumeration on MS210x.)
+		resetAndReAddDevice(target, 2000L)
 	}
 
 	//--------------------------------------------------------------------------------
@@ -462,7 +593,7 @@ class DeviceDetectorFragment constructor() : Fragment() {
 	// (because the FFI getDeviceInfo() returned garbled descriptors with
 	// a corrupted name field like "\x01").  This method iterates all
 	// devices in the USBMonitor and resets any that match known UVC
-	// VID/PIDs (MS210x 0x534D:0x2109) or that are already tracked in
+	// VID/PIDs (MS210x 0x534D:0x0021) or that are already tracked in
 	// mConnectors (could be garbled).
 	fun forceResetAllUvcDevices() {
 		Log.i(TAG, "forceResetAllUvcDevices: resetting all UVC devices")
@@ -477,7 +608,7 @@ class DeviceDetectorFragment constructor() : Fragment() {
 
 		// Known UVC video grabber VID:PIDs
 		val uvcVidPids = setOf(
-			Pair(0x534D, 0x2109),  // MS210x
+			Pair(0x534D, 0x0021),  // MS210x (EasierCAP) — confirmed via live lsusb
 		)
 
 		var resetCount = 0
@@ -489,18 +620,32 @@ class DeviceDetectorFragment constructor() : Fragment() {
 				if (isUvc || isTracked) {
 					Log.i(TAG, "forceResetAllUvcDevices: resetting ${device.deviceName} " +
 						"(vid=0x${device.vendorId.toString(16)}, pid=0x${device.productId.toString(16)}, tracked=$isTracked)")
-					removeDevice(device)
-					resetUsbDevice(device)
-					resetCount++
-					// Re-add after 500ms
-					val handler = mAsyncHandler
-					if (handler != null) {
-						handler.postDelayed({
-							if (mUSBMonitor != null && mUSBMonitor!!.hasPermission(device)) {
-								addDevice(device)
-							}
-						}, 500L)
+					// BUG-32: Do NOT call removeDevice() here — it triggers the native
+					// DeviceDetector::remove → uvc_stop → Device::~Device() → close(FD)
+					// which races with native unique_fd ownership → fdsan SIGABRT.
+					// Instead, just reset the USB device.  The USBDEVFS_RESET will
+					// cause a USB detach+reattach on the bus, which fires the natural
+					// onDetach → removeDevice path safely via the async handler.
+					// Also remove from mConnectors and graveyard the stale connector
+					// without triggering the native remove path.  The USBDEVFS_RESET
+					// will cause the kernel to invalidate the FD; the native unique_fd
+					// will close it when the DeviceConnector is eventually destructed.
+					// BUG-33: Do NOT call connector.close() — the native side owns the
+					// FD.  Just graveyard it to prevent the GC finalizer double-close.
+					val staleConnector = mConnectors.remove(device)
+					if (staleConnector != null) {
+						retainClosedConnector(
+							staleConnector,
+							reason = "forceResetAllUvcDevices (native owns FD)",
+							deviceName = device.deviceName
+						)
+						synchronized(mClosedConnectorGraveyard) {
+							mClosedConnectorGraveyard.add(staleConnector)
+						}
 					}
+					// BUG-36: Reset + refresh + re-add with fresh FD after delay.
+					resetAndReAddDevice(device, 2000L)
+					resetCount++
 				}
 			}
 		}
@@ -530,6 +675,22 @@ class DeviceDetectorFragment constructor() : Fragment() {
 					mConnectors.put(device, connector)
 				}
 				storedInMap = true
+				// BUG-36: Cache clean Android UsbDevice descriptors BEFORE nativeAdd.
+				// The native get_device_info reads from libusb which returns garbled
+				// descriptors after a hub power-cycle.  By caching the Android
+				// UsbDevice values here, get_device_info can override the garbled
+				// fields with clean ones keyed by the device path.
+				try {
+					nativeSetDeviceInfo(
+						device.deviceName,
+						device.vendorId, device.productId,
+						device.deviceClass, device.deviceSubclass, device.deviceProtocol,
+						device.manufacturerName, device.productName,
+						device.serialNumber
+					)
+				} catch (e: Exception) {
+					Log.w(TAG, "nativeSetDeviceInfo failed (non-fatal): ${e.message}")
+				}
 				mDeviceDetector.add(device, connector.fileDescriptor)
 			} catch (e: IOException) {
 				// IOException here usually means USB bus is still settling (e.g. long cable,
@@ -552,34 +713,53 @@ class DeviceDetectorFragment constructor() : Fragment() {
 				if (retryCount < 3) {
 					val handler = mAsyncHandler
 					if (handler != null) {
-						handler.postDelayed({
-							// Guard: make sure the device is still attached and we still have permission
-							if (mUSBMonitor != null && mUSBMonitor!!.hasPermission(device)) {
-								addDevice(device, retryCount + 1)
-							}
-						}, 500L * (retryCount + 1))
-					}
+							handler.postDelayed({
+								// Guard: make sure the device is still attached and we still have permission
+								if (mUSBMonitor != null && mUSBMonitor!!.hasPermission(device)) {
+									// BUG-41: On first retry, use resetAndReAddDevice to
+									// force a USBDEVFS_RESET + fresh FD.  The initial
+									// addDevice failed (IOException from claim), so the
+									// device may be in a stale kernel state that needs a
+									// reset to clear.  Subsequent retries just retry addDevice.
+									if (retryCount == 0) {
+										resetAndReAddDevice(device, 2000L)
+									} else {
+										addDevice(device, retryCount + 1)
+									}
+								}
+							}, 500L * (retryCount + 1))
+						}
 				} else {
 					Log.e(TAG, "addDevice failed after ${retryCount + 1} attempts for ${device.deviceName} — giving up")
 				}
 			} catch (e: Exception) {
 				Log.e(TAG, "addDevice unexpected exception for ${device.deviceName} (attempt ${retryCount + 1})", e)
 
-				// Defensive cleanup for non-IOException paths so we never leave a
-				// connector reachable only by GC finalizer.
+				// BUG-33: Defensive cleanup for non-IOException paths so we never
+				// leave a connector reachable only by GC finalizer.
+				// When storedInMap == true, mDeviceDetector.add() was called, so the
+				// native side may already own the FD.  Do NOT call close() — just
+				// graveyard it to prevent the finalizer double-close.
 				if (storedInMap) {
 					val removed: UsbConnector? = synchronized(mConnectors) {
 						mConnectors.remove(device)
 					}
 					if (removed != null) {
-						try { removed.close() } catch (_: Exception) {}
 						retainClosedConnector(
 							removed,
 							reason = "addDevice unexpected exception after map insert",
 							deviceName = device.deviceName
 						)
+						synchronized(mClosedConnectorGraveyard) {
+							mClosedConnectorGraveyard.add(removed)
+						}
+						// Also tell native to release this device, since the add
+						// may have partially succeeded on the native side.
+						try { mDeviceDetector.remove(device) } catch (_: Exception) {}
 					}
 				} else if (connector != null) {
+					// mDeviceDetector.add() was never reached, so Java still owns
+					// the FD — safe to close() here.
 					try { connector.close() } catch (_: Exception) {}
 					retainClosedConnector(
 						connector,
@@ -588,12 +768,22 @@ class DeviceDetectorFragment constructor() : Fragment() {
 					)
 				}
 			}
+		} else {
+			// BUG-39 (2026-07-19): hasPermission returned false — silently
+			// returned before, leaving the device stuck without a permission
+			// request.  After a USBDEVFS_RESET, the device re-enumerates with
+			// a new UsbDevice object and the permission grant may not carry
+			// over.  Request permission here so the user gets the prompt.
+			Log.w(TAG, "addDevice: no permission for ${device.deviceName} — requesting")
+			bringToForeground()
+			exitImmersiveMode()
+			mUSBMonitor!!.requestPermission(device)
 		}
 	}
 
 	/**
-	 * native側から登録解除する
-	 *
+	* native側から登録解除する
+	*
 	 * BUG-21 (fdsan SIGABRT via Parcel-owned FD on rapid detach):
 	 *
 	 * When all USB devices detach simultaneously (e.g. car ignition off),
@@ -623,56 +813,33 @@ class DeviceDetectorFragment constructor() : Fragment() {
 	 */
 	private fun removeDevice(device: UsbDevice) {
 		if (DEBUG) Log.v(TAG, "removeDevice:" + device.deviceName)
-		mDeviceDetector.remove(device)
+		// BUG-40 (2026-07-19): Do NOT call mDeviceDetector.remove(device) here.
+		// On physical unplug, the native DeviceDetector::remove() → uvc_stop →
+		// UVCCameraBase::~UVCCameraBase() → std::thread::~thread() path calls
+		// std::terminate() if the UVC streaming thread is still joinable (running).
+		// This is a bug in the prebuilt native library — uvc_stop doesn't wait
+		// for the streaming thread to finish before destroying the UVCCameraBase.
+		// The crash is a SIGABRT with abort message "terminating".
+		//
+		// Fix: just remove from mConnectors (Java-only) and graveyard the connector.
+		// The native side will clean up when the FD becomes invalid (the device is
+		// physically gone).  This is the same pattern used by forceResetAllUvcDevices
+		// (BUG-32 fix) which already avoids mDeviceDetector.remove() for the same
+		// class of native destructor crash.
 		synchronized(mConnectors) {
 			if (mConnectors.containsKey(device)) {
 				val removed = mConnectors.remove(device)
 				if (removed != null) {
-					// Post the actual close() to the async handler with a delay
-					// so the native Parcel can release FD ownership first.
-					// BUG-21b: Use a staggered delay — 300ms base + 100ms per
-					// pending close — so simultaneous multi-device detach
-					// (ignition off) doesn't fire all closes at once.
-					val handler = mAsyncHandler
-					if (handler != null) {
-						synchronized(mClosedConnectorGraveyard) {
-							mPendingCloseCount++
-						}
-						val closeDelay = 300L + (mPendingCloseCount - 1) * 100L
-						handler.postDelayed({
-							try {
-								removed.close()
-							} catch (e: Exception) {
-								Log.w(TAG, "removeDevice: deferred close threw: ${e.message}")
-							}
-							// Retain in process-lifetime graveyard so the GC
-							// finalizer cannot double-close the FD.
-							retainClosedConnector(
-								removed,
-								reason = "removeDevice deferred close",
-								deviceName = device.deviceName
-							)
-							synchronized(mClosedConnectorGraveyard) {
-								mClosedConnectorGraveyard.add(removed)
-								mPendingCloseCount--
-							}
-						}, closeDelay)
-					} else {
-						// No async handler (fragment being destroyed) — close
-						// immediately as a fallback.  This is the old path that
-						// could crash, but it only fires during fragment teardown
-						// where the process is likely exiting anyway.
-						try { removed.close() } catch (e: Exception) {
-							Log.w(TAG, "removeDevice: immediate close threw: ${e.message}")
-						}
-						retainClosedConnector(
-							removed,
-							reason = "removeDevice immediate close (no handler)",
-							deviceName = device.deviceName
-						)
-						synchronized(mClosedConnectorGraveyard) {
-							mClosedConnectorGraveyard.add(removed)
-						}
+					// BUG-33: Do NOT call UsbConnector.close() — the native side
+					// owns the FD.  Just graveyard it to prevent the GC finalizer
+					// double-close.
+					retainClosedConnector(
+						removed,
+						reason = "removeDevice (native owns FD, BUG-40 skip native remove)",
+						deviceName = device.deviceName
+					)
+					synchronized(mClosedConnectorGraveyard) {
+						mClosedConnectorGraveyard.add(removed)
 					}
 				}
 			}
@@ -739,7 +906,24 @@ class DeviceDetectorFragment constructor() : Fragment() {
 			if (DEBUG) Log.v(TAG, "Callback#onAttach:" + device.deviceName)
 			if (mUSBMonitor!!.hasPermission(device)) {
 				// すでにパーミッションを保持しているとき
-				addDevice(device)
+				// BUG-31: After a USB hub power-cycle, the MS210x may still be
+				// mid-enumeration when onAttach fires.  Calling addDevice()
+				// immediately causes a claim failure (err=-4 / EBADF) that
+				// corrupts the native device state and leaves descriptors
+				// permanently garbled.  Delay addDevice() by 4s to give the
+				// USB bus time to stabilize (increased from 2s — 2s was not
+				// enough on the Lenovo TB373FU / Android 16, the UVC interface
+				// claim still failed with LIBUSB_ERROR_NO_DEVICE).
+				val handler = mAsyncHandler
+				if (handler != null) {
+					handler.postDelayed({
+						if (mUSBMonitor != null && mUSBMonitor!!.hasPermission(device) && !mConnectors.containsKey(device)) {
+							addDevice(device)
+						}
+					}, 4000L)
+				} else {
+					addDevice(device)
+				}
 			} else {
 				// パーミッションを保持していないとき
 				// Bring the app to the foreground BEFORE requesting USB permission so

@@ -40,6 +40,12 @@ private:
 	uvc_video_size_t m_current_size;
 	std::vector<const uvc_video_size_t> m_supported_size;
 	std::vector<uint64_t> m_supported_ctrls;
+	// BUG-36: result of the initial uvc_resize() call made in the constructor.
+	// 0 = real UVC claim succeeded, non-zero = failed (e.g. garbled descriptors,
+	// device mid-enumeration). FlutterPluginJava::add() uses this to decide
+	// whether to notify Dart of a successful attach instead of assuming success
+	// just because a FlutterUVCHolder object could be constructed.
+	int m_claim_result;
 	/**
 	 * 対応しているUVC設定機能一覧を更新する
 	 */
@@ -89,6 +95,15 @@ public:
 
 	[[nodiscard]]
 	bool is_running() const;
+
+	/**
+	 * BUG-36: whether the initial uvc_resize() claim succeeded (0) or failed
+	 * (non-zero). Used to gate the Dart on_device_changed(true) notification
+	 * on real UVC claim success rather than just object construction.
+	 * @return
+	 */
+	[[nodiscard]]
+	inline int claim_result() const { return m_claim_result; };
 
 	int set_config(const int32_t &enabled, const bool &use_first_config);
 

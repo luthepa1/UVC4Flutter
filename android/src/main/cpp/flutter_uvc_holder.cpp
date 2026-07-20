@@ -74,11 +74,18 @@ FlutterUVCHolder::FlutterUVCHolder(
 	m_device_id(device_id),
 	m_current_size(),
 	m_supported_size(),
-	m_supported_ctrls()
+	m_supported_ctrls(),
+	m_claim_result(-1)
 {
 	ENTER();
 
-	uvc_resize(m_manager, m_device_id, frame_type, width, height);
+	// BUG-36: capture the real UVC claim result instead of discarding it.
+	// FlutterPluginJava::add() uses claim_result() to decide whether the
+	// device actually attached successfully before notifying Dart.
+	m_claim_result = uvc_resize(m_manager, m_device_id, frame_type, width, height);
+	if (m_claim_result) {
+		LOGW("uvc_resize failed, claim likely unsuccessful, err=%d", m_claim_result);
+	}
 
 	// 対応解像度一覧を取得する
 	int32_t num_supported = 0;

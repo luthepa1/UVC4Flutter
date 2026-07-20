@@ -35,6 +35,8 @@
 // android
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
+// std
+#include <algorithm>
 // aandusb
 #include "utilbase.h"
 // common
@@ -110,6 +112,9 @@ void FlutterPluginJava::terminate_all() {
 		}
 	}
 	holders.clear();
+	device_path_by_id.clear();
+	pending_device_paths.clear();
+	android_device_info_cache.clear();
 
 	EXIT();
 }
@@ -142,6 +147,61 @@ FlutterUVCHolderSp FlutterPluginJava::get_holder_locked(const int32_t &device_id
 	RET(result);
 }
 
+void FlutterPluginJava::bind_device_path_locked(const int32_t &device_id, const std::string &device_path) {
+	if (device_path.empty()) return;
+	if (android_device_info_cache.find(device_path) == android_device_info_cache.end()) {
+		return;
+	}
+	device_path_by_id[device_id] = device_path;
+	pending_device_paths.erase(
+		std::remove(pending_device_paths.begin(), pending_device_paths.end(), device_path),
+		pending_device_paths.end());
+}
+
+std::string FlutterPluginJava::resolve_device_path_locked(const int32_t &device_id) {
+	const auto mapped = device_path_by_id.find(device_id);
+	if (mapped != device_path_by_id.end() &&
+		android_device_info_cache.find(mapped->second) != android_device_info_cache.end()) {
+		return mapped->second;
+	}
+
+	usb_device_info_t info;
+	memset(&info, 0, sizeof(info));
+	if (usb_get_device_info(m_manager, device_id, &info) == 0) {
+		const std::string from_libusb(reinterpret_cast<const char*>(info.name));
+		LOGI("resolve_device_path_locked: device_id=%d libusb_name=\"%s\" (len=%d) vid=0x%x pid=0x%x",
+			device_id, from_libusb.c_str(), (int)from_libusb.length(),
+			info.vendor_id, info.product_id);
+		if (!from_libusb.empty() &&
+			android_device_info_cache.find(from_libusb) != android_device_info_cache.end()) {
+			bind_device_path_locked(device_id, from_libusb);
+			return from_libusb;
+		}
+	} else {
+		LOGW("resolve_device_path_locked: usb_get_device_info failed for device_id=%d", device_id);
+	}
+
+	LOGI("resolve_device_path_locked: device_id=%d searching pending_device_paths (size=%" FMT_SIZE_T ")",
+		device_id, pending_device_paths.size());
+	for (auto it = pending_device_paths.begin(); it != pending_device_paths.end(); ++it) {
+		const auto &candidate = *it;
+		LOGI("resolve_device_path_locked: pending candidate=\"%s\" in_cache=%d",
+			candidate.c_str(),
+			android_device_info_cache.find(candidate) != android_device_info_cache.end() ? 1 : 0);
+		if (!candidate.empty() &&
+			android_device_info_cache.find(candidate) != android_device_info_cache.end()) {
+			device_path_by_id[device_id] = candidate;
+			pending_device_paths.erase(it);
+			LOGI("resolve_device_path_locked: bound device_id=%d to pending path=\"%s\"", device_id, candidate.c_str());
+			return candidate;
+		}
+	}
+
+	LOGW("resolve_device_path_locked: FAILED to resolve path for device_id=%d (cache_size=%" FMT_SIZE_T " pending_size=%" FMT_SIZE_T ")",
+		device_id, android_device_info_cache.size(), pending_device_paths.size());
+	return std::string();
+}
+
 /**
  * UVC機器が接続された時の処理
  * @param info
@@ -153,9 +213,32 @@ int FlutterPluginJava::add(const int32_t &device_id) {
 	int result = -1;
 	{
 		std::lock_guard<std::mutex> lock(m_lock);
+		const auto resolved_path = resolve_device_path_locked(device_id);
+		if (!resolved_path.empty()) {
+			LOGI("add: bound runtime device_id=%d to Android path=%s",
+				device_id, resolved_path.c_str());
+		} else {
+			LOGW("add: unable to resolve Android path for runtime device_id=%d (cache size=%" FMT_SIZE_T ")",
+				device_id, android_device_info_cache.size());
+		}
 		auto holder = get_holder_locked(device_id, true);
-		if (holder) {
+		// BUG-36: previously, result was set to 0 (success) whenever a
+		// FlutterUVCHolder object existed at all — even if its constructor's
+		// internal uvc_resize() call failed to actually claim the UVC
+		// interface (e.g. garbled descriptors after a hub power droop).
+		// That caused send_on_device_changed(true) to fire unconditionally,
+		// telling Dart the camera was ready when it never actually attached,
+		// which the watchdog then treated as "stuck" and looped forever.
+		// Gate success on the real claim result instead.
+		if (holder && !holder->claim_result()) {
 			result = 0;
+		} else if (holder) {
+			LOGW("add: UVC claim failed for device_id=%d, err=%d — not notifying Dart",
+				device_id, holder->claim_result());
+			// Drop the failed holder so a subsequent attach attempt (e.g.
+			// after a native/Kotlin USB reset) gets a fresh FlutterUVCHolder
+			// rather than reusing this failed one.
+			holders.erase(device_id);
 		}
 	}
 	if (!result) {
@@ -181,9 +264,28 @@ void FlutterPluginJava::remove(const int32_t &device_id) {
 			removed = iter->second;
 			holders.erase(device_id);
 		}
+		const auto mapped = device_path_by_id.find(device_id);
+		if (mapped != device_path_by_id.end()) {
+			android_device_info_cache.erase(mapped->second);
+			pending_device_paths.erase(
+				std::remove(pending_device_paths.begin(), pending_device_paths.end(), mapped->second),
+				pending_device_paths.end());
+			device_path_by_id.erase(mapped);
+		} else {
+			// Fallback when no runtime->path mapping exists.
+			usb_device_info_t info;
+			memset(&info, 0, sizeof(info));
+			if (usb_get_device_info(m_manager, device_id, &info) == 0) {
+				std::string device_path(reinterpret_cast<const char*>(info.name));
+				android_device_info_cache.erase(device_path);
+				pending_device_paths.erase(
+					std::remove(pending_device_paths.begin(), pending_device_paths.end(), device_path),
+					pending_device_paths.end());
+			}
+		}
 	}
 	if (removed) {
-		LOGD("remove %d", id);
+		LOGD("remove %d", device_id);
 		removed->stop();
 		send_on_device_changed(device_id, false);
 		LOGD("remove: finished");
@@ -232,9 +334,88 @@ usb_device_info_t FlutterPluginJava::get_device_info(const int32_t &device_id) {
 	ENTER();
 
 	usb_device_info_t result;
+	// BUG-36 fix: Use usb_get_device_info to get the device path (name field),
+	// then look up the Android descriptor cache by path.  Even when libusb
+	// descriptors are garbled (vid=0x534d0200, product=""), the name field
+	// (device path like "/dev/bus/usb/001/010") comes from the kernel and is
+	// always correct.  If we find cached Android descriptors for this path,
+	// override the garbled fields with the clean Android values.
 	usb_get_device_info(m_manager, device_id, &result);
 
+	// Resolve canonical path from runtime device_id first (source of truth),
+	// then fall back to the libusb name field.
+	std::string device_path;
+	{
+		std::lock_guard<std::mutex> lock(m_lock);
+		device_path = resolve_device_path_locked(device_id);
+		if (device_path.empty()) {
+			device_path = std::string(reinterpret_cast<const char*>(result.name));
+		}
+
+		// Check if libusb descriptors look garbled (VID/PID > 0xFFFF or
+		// name is not a valid /dev/bus/usb path).  If so, and we still
+		// haven't found a cache entry, try a last-resort fallback: if
+		// there's exactly ONE entry in the Android cache, assume it's
+		// this device.  This handles the case where the prebuilt lib's
+		// device_id mapping and the pending_device_paths queue got out
+		// of sync due to a race between addDevice retries and the
+		// on_device_attach callback.
+		const bool libusb_garbled = result.vendor_id > 0xFFFF ||
+			result.product_id > 0xFFFF ||
+			(device_path.find("/dev/bus/usb/") != 0 && device_path.length() < 4);
+
+		auto iter = android_device_info_cache.find(device_path);
+		if (iter == android_device_info_cache.end() && libusb_garbled) {
+			LOGW("get_device_info: cache miss + garbled libusb for id=%d — trying single-entry fallback", device_id);
+			if (android_device_info_cache.size() == 1) {
+				iter = android_device_info_cache.begin();
+				device_path = iter->first;
+				device_path_by_id[device_id] = device_path;
+				LOGI("get_device_info: single-entry fallback — bound device_id=%d to path=\"%s\"", device_id, device_path.c_str());
+			}
+		}
+		if (iter != android_device_info_cache.end()) {
+			// Override garbled libusb fields with clean Android values.
+			// Also override name/path because in some failure states libusb reports
+			// "unknown" path, which triggers Dart watchdog invalid-path fallback.
+			const auto &clean = iter->second;
+			memcpy(result.name, clean.name, sizeof(result.name));
+			result.vendor_id = clean.vendor_id;
+			result.product_id = clean.product_id;
+			result.device_class = clean.device_class;
+			result.device_subclass = clean.device_subclass;
+			result.device_protocol = clean.device_protocol;
+			memcpy(result.manufacturer_name, clean.manufacturer_name, sizeof(result.manufacturer_name));
+			memcpy(result.product_name, clean.product_name, sizeof(result.product_name));
+			memcpy(result.serial, clean.serial, sizeof(result.serial));
+			device_path_by_id[device_id] = device_path;
+			LOGD("get_device_info: using cached Android descriptors for id=%d path=%s", device_id, device_path.c_str());
+		} else {
+			LOGW("get_device_info: no Android cache for id=%d path=\"%s\" (libusb vid=0x%x pid=0x%x name=\"%s\") — descriptors will be garbled",
+				device_id, device_path.c_str(),
+				result.vendor_id, result.product_id,
+				reinterpret_cast<const char*>(result.name));
+		}
+	}
+
 	RET(result);
+}
+
+void FlutterPluginJava::set_device_info(const std::string &device_path, const usb_device_info_t &info) {
+	ENTER();
+
+	std::lock_guard<std::mutex> lock(m_lock);
+	android_device_info_cache[device_path] = info;
+	pending_device_paths.erase(
+		std::remove(pending_device_paths.begin(), pending_device_paths.end(), device_path),
+		pending_device_paths.end());
+	pending_device_paths.push_back(device_path);
+	LOGI("set_device_info: cached Android descriptors for path=%s "
+		 "(vid=0x%x pid=0x%x product=\"%s\")",
+		 device_path.c_str(), info.vendor_id, info.product_id,
+		 reinterpret_cast<const char*>(info.product_name));
+
+	EXIT();
 }
 
 /**

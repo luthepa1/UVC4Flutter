@@ -142,7 +142,12 @@ class UVCManager: FlutterPlugin, MethodCallHandler, ActivityAware {
             // BUG-23 fix: If the device path is not a valid /dev/bus/usb/ path
             // (garbled FFI returned "\x01"), use the fallback that resets all
             // UVC devices instead of failing silently.
-            if (devicePath.startsWith("/dev/bus/usb/")) {
+            // BUG-23b: "/dev/bus/usb/unknown/NNN" is the Dart-side fallback path
+            // used when getDeviceInfo() returns garbled descriptors.  It passes
+            // the plain startsWith check but will never match a real UsbDevice
+            // (Android uses /dev/bus/usb/BBB/DDD).  Reject paths containing
+            // "/unknown/" so forceResetAllUvcDevices is used as the fallback.
+            if (devicePath.startsWith("/dev/bus/usb/") && !devicePath.contains("/unknown/")) {
               DeviceDetector.forceResetUvcDevice(a, devicePath)
             } else {
               Log.w(TAG, "onMethodCall#forceResetDevice: invalid path '$devicePath' — using forceResetAllUvcDevices fallback")
@@ -292,7 +297,7 @@ class UVCManager: FlutterPlugin, MethodCallHandler, ActivityAware {
   external fun nativeSetSurface(deviceId: Int, texId: Long, surface: Surface?): Int
 
   companion object {
-    private const val DEBUG = false // set false on production
+    private const val DEBUG = true // set false on production
     private val TAG = UVCManager::class.java.simpleName
 
     private const val METHOD_CHANNEL_NAME = "com.serenegiant.flutter/aandusb_method"
