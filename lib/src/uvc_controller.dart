@@ -186,14 +186,36 @@ class UVCController implements UVCControllerInterface {
   }
 
   /// UVC機器からの映像取得を開始
+  ///
+  /// BUG-still-frame: Previously this method silently returned 0 when the
+  /// device was not in CONNECTED state or textureId was invalid, without
+  /// ever calling uvc_start().  The caller (_safeStart in video_grab_manager)
+  /// only caught exceptions — it never checked the return value — so
+  /// openDevice marked the device as streaming with a valid textureId even
+  /// though the native streaming thread was never started.  The Flutter
+  /// Texture widget rendered the initial surface frame (or the last frame
+  /// before a stall) but no subsequent frames were pushed, producing a
+  /// permanent still image instead of live video.
+  ///
+  /// Fix: throw StateError when the preconditions aren't met so the caller's
+  /// try/catch detects the failure, marks the device as error, and the
+  /// BUG-6 retry path re-attempts the open.  Also throw on non-zero return
+  /// from uvc_start() (native start failure).
   @override
   Future<int> start() async {
-    if (_debug) _logger.d("UVCController#start:deviceId=$deviceId,textureId=$textureId,state=${state()}");
-    if ((state() == device_state.CONNECTED) && (textureId >= 0)) {
-      return compute(_start, deviceId);
-    } else {
-      return 0;
+    final currentState = state();
+    if (_debug) _logger.d("UVCController#start:deviceId=$deviceId,textureId=$textureId,state=$currentState");
+    if (currentState != device_state.CONNECTED) {
+      throw StateError('start() skipped — device $deviceId not CONNECTED (state=$currentState, textureId=$textureId)');
     }
+    if (textureId < 0) {
+      throw StateError('start() skipped — device $deviceId has no valid texture (textureId=$textureId)');
+    }
+    final result = await compute(_start, deviceId);
+    if (result != 0) {
+      throw StateError('start() failed — uvc_start returned $result for device $deviceId');
+    }
+    return result;
   }
 
   /// UVC機器からの映像取得を終了
