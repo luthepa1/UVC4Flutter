@@ -259,6 +259,7 @@ typedef struct flutter_video_size {
  * should match to usb_device_info_t in aandusb_native.h
  */
 typedef struct flutter_device_info {
+	uint16_t bcd_usb;		// USB仕様バージョン(BCD形式)。 usb_device_info_t に合わせて先頭に置く。
 	uint32_t vendor_id;
 	uint32_t product_id;
 	uint8_t device_class;

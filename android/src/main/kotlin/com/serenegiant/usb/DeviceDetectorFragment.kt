@@ -666,6 +666,22 @@ class DeviceDetectorFragment constructor() : Fragment() {
 
 	private fun addDevice(device: UsbDevice, retryCount: Int) {
 		if (DEBUG) Log.v(TAG, "addDevice:" + device.deviceName + " (attempt ${retryCount + 1})")
+		// BUG-44: Guard against duplicate add for a device already tracked.
+		// addDevice can fire from both the USB_DEVICE_ATTACHED broadcast and the
+		// onStart() delayed re-scan.  If we open a second UsbConnector for the
+		// same device and call native DeviceDetector.add() again, the native
+		// side constructs a second DeviceConnector over the same fd; when the
+		// first DeviceConnector is destructed it closes the fd that the native
+		// unique_fd (or the Java UsbDeviceConnection) still owns → fdsan SIGABRT
+		// "attempted to close file descriptor N, actually owned by unique_fd"
+		// (observed 2026-08-01, DeviceDetectorF thread, DeviceConnector::~DeviceConnector
+		// → close_device during onStart re-scan).
+		synchronized(mConnectors) {
+			if (mConnectors.containsKey(device)) {
+				if (DEBUG) Log.v(TAG, "addDevice: ${device.deviceName} already tracked — skipping duplicate add")
+				return
+			}
+		}
 		if (mUSBMonitor!!.hasPermission(device)) {
 			var connector: UsbConnector? = null
 			var storedInMap = false

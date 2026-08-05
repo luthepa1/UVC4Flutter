@@ -305,6 +305,7 @@ class UVCPluginBindings {
 }
 
 /// UVC機器との接続状態
+/// should match to device_state_t in aandusb_native.h
 enum device_state {
   /// プラグインが初期化されていない
   UNINITIALIZED(-1),
@@ -332,6 +333,7 @@ enum device_state {
 
 /// Flutterのc#側とUVCコントロール機能の設定値等をやりとりするための構造体定義
 /// Flutterのc#側にも同じ構造体を定義する必要がある
+/// should match to uvc_control_info_t in aandusb_native.h
 @ffi.Packed(1)
 final class flutter_control_info extends ffi.Struct {
   /// UVCコントロールの種類(CTRL_XXXまたはPU_XXX)
@@ -369,10 +371,12 @@ final class flutter_control_info extends ffi.Struct {
 
 /// Flutterのc#側とUVCコントロール機能の設定値等をやりとりするための構造体定義
 /// Flutterのc#側にも同じ構造体を定義する必要がある
+/// should match to uvc_control_info_t in aandusb_native.h
 typedef flutter_control_info_t = flutter_control_info;
 
 /// Flutterのc#側と映像サイズ設定をやりとりするための構造体定義
 /// Flutterのc#側にも同じ構造体を定義する必要がある
+/// should match to uvc_video_size_t in aandusb_native.h
 @ffi.Packed(1)
 final class flutter_video_size extends ffi.Struct {
   @ffi.Uint32()
@@ -415,11 +419,17 @@ final class flutter_video_size extends ffi.Struct {
 
 /// Flutterのc#側と映像サイズ設定をやりとりするための構造体定義
 /// Flutterのc#側にも同じ構造体を定義する必要がある
+/// should match to uvc_video_size_t in aandusb_native.h
 typedef flutter_video_size_t = flutter_video_size;
 
 /// 接続しているUSB機器情報
+/// should match to usb_device_info_t in aandusb_native.h
 @ffi.Packed(1)
 final class flutter_device_info extends ffi.Struct {
+  /// USB仕様バージョン(BCD形式)。 usb_device_info_t に合わせて先頭に置く。
+  @ffi.Uint16()
+  external int bcd_usb;
+
   @ffi.Uint32()
   external int vendor_id;
 
@@ -452,6 +462,7 @@ final class flutter_device_info extends ffi.Struct {
 }
 
 /// 接続しているUSB機器情報
+/// should match to usb_device_info_t in aandusb_native.h
 typedef flutter_device_info_t = flutter_device_info;
 
 const int MAX_INTERVALS = 128;
