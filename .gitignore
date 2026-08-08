@@ -4,3 +4,15 @@ android/.cxx/
 # Archives
 *.tar.gz
 *.tgz
+# Flutter/Dart build artifacts
+.dart_tool/
+build/
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+android/.gradle/
+android/build/
+example/.dart_tool/
+example/build/
+example/android/.gradle/
+example/android/build/
