@@ -191,6 +191,26 @@ class DeviceDetector private constructor() {
 
 		private const val ARGS_DEVICE_FILTERS = "ARGS_DEVICE_FILTERS"
 
+		init {
+			// Ensure the native UVC library is loaded BEFORE any DeviceDetector
+			// instance is constructed.  The instance `init` block calls nativeCreate(),
+			// which is a JNI method in libflutter-uvc-plugin.so.
+			//
+			// Without this, the library is only loaded when the UVCManager Flutter
+			// plugin is constructed (its companion-object init calls loadNative()).
+			// UVCManager is instantiated during FlutterActivity.configureFlutterEngine,
+			// which runs AFTER FragmentManager.restoreAllState() inside Activity.onCreate.
+			// When the process was previously killed in the background, the app relaunches
+			// with a saved DeviceDetectorFragment whose constructor reaches nativeCreate()
+			// during restoreAllState — before the plugin ever loads the lib — causing a
+			// fatal UnsatisfiedLinkError at startup (see logcat_2026-08-21_15-50-31.txt).
+			//
+			// Loading here (on first class touch, which always precedes the first
+			// nativeCreate()) guarantees the symbol is available on every instantiation
+			// path, including saved-state fragment restore.
+			com.serenegiant.flutter.uvcplugin.NativeLibLoader.loadNative()
+		}
+
 		/**
 		 * DeviceDetectorをUVC機器用に初期化(非UI Fragmentを使ってシングルトン的にアクセスする)
 		 * @param activity
