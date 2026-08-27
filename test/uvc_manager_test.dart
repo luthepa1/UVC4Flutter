@@ -60,9 +60,25 @@ class MockUvcManagerPlatform
   void removeListener(VoidCallback listener) {
     // TODO: implement removeListener
   }
+
+  @override
+  Future<void> rescanDevices() async {
+    // TODO: implement rescanDevices
+  }
+
+  @override
+  Future<void> forceResetDevice(String devicePath) async {
+    // TODO: implement forceResetDevice
+  }
+
+  @override
+  Future<void> forceResetAllUvcDevices() async {
+    // TODO: implement forceResetAllUvcDevices
+  }
 }
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
   final UVCManagerPlatform initialPlatform = UVCManagerPlatform.instance;
 
   test('$UVCManager is the default instance', () {
