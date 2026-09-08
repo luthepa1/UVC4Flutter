@@ -519,6 +519,13 @@ class UVCManager with ChangeNotifier, WidgetsBindingObserver implements UVCManag
 
   /// native側からのメッセージ受信処理
   void _handleNativeMessage(final message) {
+    // BUG-46 (2026-09-04): unconditional receive-path logging.  The port is
+    // the ONLY channel for attach/detach events, and when a message is lost
+    // or dropped the old logcat showed zero Dart-side reaction — impossible
+    // to distinguish "never sent" from "sent but unprocessed".  These events
+    // are rare (attach/detach only), so the log volume cost is negligible;
+    // never log per-frame traffic here.
+    debugPrint('🐛 UVCManager#nativeMessage:$message');
     if (_debug) _logger.d("UVCManager#handleNativeMessage:$message");
     final action = message[0];
     switch (action) {
