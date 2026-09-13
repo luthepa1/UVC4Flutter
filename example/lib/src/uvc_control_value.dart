@@ -30,7 +30,7 @@ class ControlValue {
   /// 自動設定かどうか
   bool _auto = false;
   /// この設定項目が有効かどうか
-  bool _enabled = true;
+  final bool _enabled = true;
   /// セレクタタイプかどうか
   bool _selectable = false;
 
@@ -47,12 +47,6 @@ class ControlValue {
     final result = ControlValue(deviceId, info, _settings);
     result.info.current = currentValue;
     return result;
-  }
-
-  /// この設定項目が有効かどうか
-  bool get isEnabled => _enabled;
-  set isEnabled(bool v) {
-    _enabled = v;
   }
 
   /// この設定項目に対応する自動設定項目が存在するかどうか

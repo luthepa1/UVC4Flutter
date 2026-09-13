@@ -60,7 +60,7 @@ class ControlInfo {
   }
 
   /// 無効なUVCコントロール
-  static final ControlInfo INVALID = ControlInfo(0, 0, 0, 0, 0, 0, 0, 0);
+  static final ControlInfo invalid = ControlInfo(0, 0, 0, 0, 0, 0, 0, 0);
 
   /// UVCコントロールの種類文字列を取得するヘルパー関数
   /// @param type

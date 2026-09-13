@@ -65,7 +65,7 @@ class VideoSize {
   }
 
   /// 無効な解像度設定値
-  static final VideoSize INVALID = VideoSize(0, 0, 0, 0, 0, List.empty(), 0, List.empty(), 0);
+  static final VideoSize invalid = VideoSize(0, 0, 0, 0, 0, List.empty(), 0, List.empty(), 0);
 
   /// フレームタイプ文字列を取得するためのヘルパー関数
   static String frameTypeString(int frameType) {

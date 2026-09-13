@@ -266,11 +266,11 @@ class UVCController implements UVCControllerInterface {
   @override
   Future<ControlInfo> setCtrlValue(int type, int value) async {
     if (_supportedControls.containsKey(type)) {
-      var ctrl = _supportedControls[type] ?? ControlInfo.INVALID;
+      var ctrl = _supportedControls[type] ?? ControlInfo.invalid;
       ctrl.current = value;
       return compute(_setCtrlValue, ctrl);
     } else {
-      return ControlInfo.INVALID;
+      return ControlInfo.invalid;
     }
   }
 
@@ -343,7 +343,7 @@ class UVCController implements UVCControllerInterface {
 
   /// 現在の解像度設定を取得する
   VideoSize _getCurrentSize(int dummy) {
-    VideoSize result = VideoSize.INVALID;
+    VideoSize result = VideoSize.invalid;
     var sz = ffi.malloc<flutter_video_size_t>();
     try {
       var r = _binding.get_current_size(deviceId, sz);
@@ -366,10 +366,10 @@ class UVCController implements UVCControllerInterface {
       if (r == 0) {
         info = _getCtrlValue(info.type);
       } else {
-        info = ControlInfo.INVALID;
+        info = ControlInfo.invalid;
       }
     } else {
-      info = ControlInfo.INVALID;
+      info = ControlInfo.invalid;
     }
 
     return info;
@@ -387,9 +387,9 @@ class UVCController implements UVCControllerInterface {
       } finally {
         ffi.calloc.free(value);
       }
-      return _supportedControls[type] ?? ControlInfo.INVALID;
+      return _supportedControls[type] ?? ControlInfo.invalid;
     } else {
-      return ControlInfo.INVALID;
+      return ControlInfo.invalid;
     }
   }
 
@@ -647,11 +647,25 @@ class UVCManager with ChangeNotifier, WidgetsBindingObserver implements UVCManag
         _availableControllers[deviceId] = connector;
         // if (_debug) _logger.d("info=${connector.getDeviceInfo()}");
       }
+      // BUG-47 (2026-09-12): The prebuilt native DeviceDetector.add() only
+      // mints a NEW runtime id when no holder exists for the device path.
+      // After a background cycle (onStop leaves the native holder alive with
+      // a dead stream — BUG-40) or a hub brownout while the FD was invalid,
+      // add() re-binds the fresh FD to the SAME id and re-sends
+      // on_device_changed(true).  The containsKey guard used to swallow that
+      // event, so nothing ever re-established the stream on the new FD and
+      // the Flutter Texture kept showing the last pre-gap frame (permanent
+      // still image; logcat 2026-09-12: re-add at 00:08:03 minted ids
+      // 165182717/-136652091 identical to the pre-drop ids, zero Dart-side
+      // reaction afterwards, 15 resume cycles all trusted stale STREAMING).
+      // Re-notify even for known ids so listeners re-check the LIVE state —
+      // VideoGrabManager's reconcile pass decides whether a reopen is needed.
+      notifyListeners();
     } else {
       var controller = _availableControllers.remove(deviceId);
       controller?.detached();
+      notifyListeners();
     }
-    notifyListeners();
   }
 }
 
