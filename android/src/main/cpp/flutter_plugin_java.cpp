@@ -185,6 +185,25 @@ std::string FlutterPluginJava::resolve_device_path_locked(const int32_t &device_
 		device_id, pending_device_paths.size());
 	for (auto it = pending_device_paths.begin(); it != pending_device_paths.end(); ++it) {
 		const auto &candidate = *it;
+		// BUG-51: skip candidates already bound to a DIFFERENT live runtime id.
+		// The stale off-by-one bound each fresh id to the PREVIOUS device's
+		// path (logcat 2026-09-19 16:42-16:43: front cam's new id bound to
+		// the rear cam's real path 016 while the kernel had already cached
+		// the front cam's fresh path 017).  A path already claimed by another
+		// live id is not pending — skipping it forces the resolver to keep
+		// searching for this device's own path (or fail loudly, which the
+		// Dart garbled-descriptor gate handles).
+		bool alreadyClaimed = false;
+		for (const auto &entry : device_path_by_id) {
+			if (entry.first != device_id && entry.second == candidate) {
+				alreadyClaimed = true;
+				break;
+			}
+		}
+		if (alreadyClaimed) {
+			LOGI("resolve_device_path_locked: candidate=\"%s\" already claimed by another live id — skipping", candidate.c_str());
+			continue;
+		}
 		LOGI("resolve_device_path_locked: pending candidate=\"%s\" in_cache=%d",
 			candidate.c_str(),
 			android_device_info_cache.find(candidate) != android_device_info_cache.end() ? 1 : 0);
@@ -414,6 +433,37 @@ void FlutterPluginJava::set_device_info(const std::string &device_path, const us
 		 "(vid=0x%x pid=0x%x product=\"%s\")",
 		 device_path.c_str(), info.vendor_id, info.product_id,
 		 reinterpret_cast<const char*>(info.product_name));
+
+	EXIT();
+}
+
+/**
+ * BUG-51: prune descriptor caches for a DETACHED device path.
+ * Metadata-only: the android_device_info_cache entry + pending queue entry
+ * + any device_path_by_id mappings pointing at the path.  Holders and FDs
+ * are NOT touched — BUG-40 doctrine: the native layer owns them and
+ * DeviceDetectorFragment's removeDevice path deliberately skips native FD
+ * removal.  Called from Kotlin removeDevice() AFTER the connector is closed
+ * so a post-detach attach cannot bind a fresh runtime id to this stale path
+ * (the off-by-one that scrambled camera identity across replugs).
+ */
+void FlutterPluginJava::prune_device_path(const std::string &device_path) {
+	ENTER();
+
+	std::lock_guard<std::mutex> lock(m_lock);
+	android_device_info_cache.erase(device_path);
+	pending_device_paths.erase(
+		std::remove(pending_device_paths.begin(), pending_device_paths.end(), device_path),
+		pending_device_paths.end());
+	for (auto it = device_path_by_id.begin(); it != device_path_by_id.end(); ) {
+		if (it->second == device_path) {
+			it = device_path_by_id.erase(it);
+		} else {
+			++it;
+		}
+	}
+	LOGI("prune_device_path: %s (cache_size=%zu pending_size=%\" FMT_SIZE_T \")",
+		device_path.c_str(), android_device_info_cache.size(), pending_device_paths.size());
 
 	EXIT();
 }

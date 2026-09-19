@@ -152,6 +152,17 @@ public:
 	 */
 	void set_device_info(const std::string &device_path, const usb_device_info_t &info);
 	/**
+	 * BUG-51: Prune descriptor caches for a DETACHED device path.
+	 * Metadata-only (cache entry + pending queue + device_path_by_id
+	 * mappings).  Holders/FDs are NOT touched — BUG-40 doctrine: the
+	 * native layer owns them and Kotlin's removeDevice skips native FD
+	 * removal by design.  Called from Kotlin (via JNI nativePruneDeviceInfo)
+	 * after the connector is closed, so a post-detach attach cannot bind a
+	 * fresh runtime id to this stale path (the off-by-one that scrambled
+	 * camera identity across replugs).
+	 */
+	void prune_device_path(const std::string &device_path);
+	/**
 	 * 映像取得開始
 	 * レンダーコールバックを呼び出さないと実際には描画されない
 	 * @param device_id

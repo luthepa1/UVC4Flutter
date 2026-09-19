@@ -492,6 +492,35 @@ static jint nativeSetDeviceInfo(JNIEnv *env, jobject,
 }
 
 //================================================================================
+// BUG-51: nativePruneDeviceInfo — prune the native descriptor cache + pending
+// queue + device_path_by_id mappings for a DETACHED device path.
+// Metadata-only: holders/FDs are NOT touched (BUG-40: the native layer owns
+// them; DeviceDetectorFragment's removeDevice skips native FD removal).
+// Called from Kotlin DeviceDetectorFragment.removeDevice() after the
+// connector is closed, so a post-detach attach can't bind a fresh runtime
+// id to this stale path (the off-by-one that scrambled camera identity).
+static jint nativePruneDeviceInfo(JNIEnv *env, jobject,
+		jstring devicePathStr)
+{
+	ENTER();
+
+	const char *devicePath = env->GetStringUTFChars(devicePathStr, nullptr);
+	if (!devicePath) {
+		RETURN(-1, jint);
+	}
+
+	int32_t result = -1;
+	std::lock_guard<std::mutex> lock(plugin_lock);
+	if (pluginJava) {
+		pluginJava->prune_device_path(std::string(devicePath));
+		result = 0;
+	}
+
+	env->ReleaseStringUTFChars(devicePathStr, devicePath);
+	RETURN(result, jint);
+}
+
+//================================================================================
 static JNINativeMethod methods[] = {
 	{ "nativeInit",	"()I", (void *) nativeInit },
 	{ "nativeRelease",	"()I", (void *) nativeRelease },
@@ -501,12 +530,14 @@ static JNINativeMethod methods[] = {
 
 // Native methods registered on DeviceDetectorFragment for USB bus reset.
 // BUG-36: nativeSetDeviceInfo added to pass Android UsbDevice descriptors.
+// BUG-51: nativePruneDeviceInfo added to prune descriptor caches on detach.
 static JNINativeMethod detectorMethods[] = {
 	{ "nativeUsbReset",	"(Ljava/lang/String;)I", (void *) nativeUsbReset },
 	{ "nativeUsbResetFd",	"(I)I", (void *) nativeUsbResetFd },
 	{ "nativeSetDeviceInfo",
 		"(Ljava/lang/String;IIIIILjava/lang/String;Ljava/lang/String;Ljava/lang/String;)I",
 		(void *) nativeSetDeviceInfo },
+	{ "nativePruneDeviceInfo",	"(Ljava/lang/String;)I", (void *) nativePruneDeviceInfo },
 };
 
 

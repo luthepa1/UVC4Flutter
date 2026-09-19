@@ -341,6 +341,12 @@ class DeviceDetectorFragment constructor() : Fragment() {
 		manufacturer: String?, product: String?, serial: String?
 	): Int
 
+	// BUG-51: Prune the native descriptor cache + pending queue + stale
+	// device_path_by_id mappings for a detached device path.  Metadata-only;
+	// holders/FDs are NOT touched (BUG-40 preserved).  Call AFTER the
+	// connector is closed in removeDevice().
+	private external fun nativePruneDeviceInfo(devicePath: String): Int
+
 	private fun resetUsbDevice(device: UsbDevice): Boolean {
 		val deviceName = device.deviceName  // e.g. "/dev/bus/usb/001/010"
 		if (deviceName.isNullOrEmpty()) return false
@@ -859,6 +865,17 @@ class DeviceDetectorFragment constructor() : Fragment() {
 					}
 				}
 			}
+		}
+		// BUG-51: prune the native descriptor cache + pending queue + stale
+		// device_path_by_id mappings for this path.  Metadata-only — does NOT
+		// touch holders/FDs (BUG-40 preserved above).  Without this, a
+		// post-detach attach resolved via the stale pending queue and bound
+		// a fresh runtime id to this dead path (the off-by-one that scrambled
+		// camera identity across replugs).
+		try {
+			nativePruneDeviceInfo(device.deviceName)
+		} catch (e: Exception) {
+			Log.w(TAG, "nativePruneDeviceInfo failed (non-fatal): ${e.message}")
 		}
 	}
 
