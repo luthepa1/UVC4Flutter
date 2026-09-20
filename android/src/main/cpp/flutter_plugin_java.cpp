@@ -37,6 +37,8 @@
 #include <android/native_window_jni.h>
 // std
 #include <algorithm>
+#include <cstdio>
+#include <cstring>
 // aandusb
 #include "utilbase.h"
 // common
@@ -349,6 +351,48 @@ device_state FlutterPluginJava::get_device_state(const int32_t &device_id) {
 	RETURN(result, device_state);
 }
 
+/**
+ * BUG-53: is this a USB device path we are willing to trust?
+ * Requires the exact "/dev/bus/usb/BBB/DDD" shape with digits only after the
+ * prefix.  usb_get_device_info() can leave a stray trailing byte when its
+ * control transfer fails, which produced paths like
+ * "/dev/bus/usb/001/007k" in logcat (2026-09-19 22:53).  Such a path misses
+ * the Android descriptor cache lookup, cascading into garbage descriptors.
+ */
+static bool is_valid_usb_path(const std::string &path) {
+	static const char kPrefix[] = "/dev/bus/usb/";
+	const size_t prefix_len = sizeof(kPrefix) - 1;
+	if (path.size() <= prefix_len) {
+		return false;
+	}
+	if (path.compare(0, prefix_len, kPrefix) != 0) {
+		return false;
+	}
+	for (size_t i = prefix_len; i < path.size(); ++i) {
+		const char c = path[i];
+		if (c != '/' && (c < '0' || c > '9')) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/**
+ * BUG-53: USB string descriptors are printable ASCII.  Anything outside that
+ * range means the read failed or returned stale memory — the "AêÝÊ" /
+ * "M~8\x0bk" product/manufacturer junk seen in the camera settings sheet.
+ * Empty counts as trustworthy (the identity layer treats it as "identifying").
+ */
+static bool is_trustworthy_text(const uint8_t *buf, size_t len) {
+	for (size_t i = 0; i < len && buf[i] != 0; ++i) {
+		const uint8_t c = buf[i];
+		if (c < 0x20 || c > 0x7e) {
+			return false;
+		}
+	}
+	return true;
+}
+
 usb_device_info_t FlutterPluginJava::get_device_info(const int32_t &device_id) {
 	ENTER();
 
@@ -359,46 +403,74 @@ usb_device_info_t FlutterPluginJava::get_device_info(const int32_t &device_id) {
 	// (device path like "/dev/bus/usb/001/010") comes from the kernel and is
 	// always correct.  If we find cached Android descriptors for this path,
 	// override the garbled fields with the clean Android values.
-	usb_get_device_info(m_manager, device_id, &result);
+	//
+	// BUG-53: zero the struct and CHECK the return code.  This is the only
+	// call site that did neither (compare resolve_device_path_locked and
+	// remove(), which both memset first).  usb_get_device_info() leaves its
+	// output buffer untouched when the control transfer fails, so an
+	// uninitialized stack struct was leaking arbitrary memory to Dart as
+	// product/manufacturer/serial — and, because the failure path does not
+	// NUL-terminate name[], a stray byte trailed the path (logcat 2026-09-19
+	// 22:53: name="/dev/bus/usb/001/007k").  The corrupted path then missed
+	// the Android cache lookup below, cascading into the "descriptors will be
+	// garbled" branch and an unselectable camera chip in the settings sheet.
+	memset(&result, 0, sizeof(result));
+	const int info_rc = usb_get_device_info(m_manager, device_id, &result);
 
 	// Resolve canonical path from runtime device_id first (source of truth),
-	// then fall back to the libusb name field.
+	// then fall back to the libusb name field — but only accept a path that
+	// actually parses as /dev/bus/usb/BBB/DDD.
 	std::string device_path;
 	{
 		std::lock_guard<std::mutex> lock(m_lock);
 		device_path = resolve_device_path_locked(device_id);
+		if (!is_valid_usb_path(device_path)) {
+			device_path.clear();
+		}
 		if (device_path.empty()) {
-			device_path = std::string(reinterpret_cast<const char*>(result.name));
+			const std::string from_libusb(reinterpret_cast<const char*>(result.name));
+			if (is_valid_usb_path(from_libusb)) {
+				device_path = from_libusb;
+			}
 		}
 
-		// Check if libusb descriptors look garbled (VID/PID > 0xFFFF or
-		// name is not a valid /dev/bus/usb path).  If so, and we still
-		// haven't found a cache entry, try a last-resort fallback: if
-		// there's exactly ONE entry in the Android cache, assume it's
-		// this device.  This handles the case where the prebuilt lib's
-		// device_id mapping and the pending_device_paths queue got out
-		// of sync due to a race between addDevice retries and the
+		// Check if libusb descriptors look garbled (VID/PID > 0xFFFF or no
+		// trustworthy path).  If so, and we still haven't found a cache entry,
+		// try a last-resort fallback: if there's exactly ONE entry in the
+		// Android cache, assume it's this device.  This handles the case where
+		// the prebuilt lib's device_id mapping and the pending_device_paths
+		// queue got out of sync due to a race between addDevice retries and the
 		// on_device_attach callback.
 		const bool libusb_garbled = result.vendor_id > 0xFFFF ||
 			result.product_id > 0xFFFF ||
-			(device_path.find("/dev/bus/usb/") != 0 && device_path.length() < 4);
+			device_path.empty();
 
-		auto iter = android_device_info_cache.find(device_path);
-		if (iter == android_device_info_cache.end() && libusb_garbled) {
+		auto iter = device_path.empty()
+			? android_device_info_cache.end()
+			: android_device_info_cache.find(device_path);
+		if (iter == android_device_info_cache.end() && libusb_garbled &&
+			android_device_info_cache.size() == 1) {
 			LOGW("get_device_info: cache miss + garbled libusb for id=%d — trying single-entry fallback", device_id);
-			if (android_device_info_cache.size() == 1) {
-				iter = android_device_info_cache.begin();
-				device_path = iter->first;
-				device_path_by_id[device_id] = device_path;
-				LOGI("get_device_info: single-entry fallback — bound device_id=%d to path=\"%s\"", device_id, device_path.c_str());
-			}
+			iter = android_device_info_cache.begin();
+			device_path = iter->first;
+			device_path_by_id[device_id] = device_path;
+			LOGI("get_device_info: single-entry fallback — bound device_id=%d to path=\"%s\"", device_id, device_path.c_str());
 		}
+
+		// BUG-53: always re-serialize name from the VALIDATED path rather than
+		// trusting the libusb/cached buffer, so a stray trailing byte can never
+		// reach Dart (the "/dev/bus/usb/001/007k" case).
+		if (!device_path.empty()) {
+			memset(result.name, 0, sizeof(result.name));
+			snprintf(reinterpret_cast<char*>(result.name), sizeof(result.name),
+				"%s", device_path.c_str());
+		}
+
 		if (iter != android_device_info_cache.end()) {
 			// Override garbled libusb fields with clean Android values.
 			// Also override name/path because in some failure states libusb reports
 			// "unknown" path, which triggers Dart watchdog invalid-path fallback.
 			const auto &clean = iter->second;
-			memcpy(result.name, clean.name, sizeof(result.name));
 			result.vendor_id = clean.vendor_id;
 			result.product_id = clean.product_id;
 			result.device_class = clean.device_class;
@@ -410,8 +482,28 @@ usb_device_info_t FlutterPluginJava::get_device_info(const int32_t &device_id) {
 			device_path_by_id[device_id] = device_path;
 			LOGD("get_device_info: using cached Android descriptors for id=%d path=%s", device_id, device_path.c_str());
 		} else {
-			LOGW("get_device_info: no Android cache for id=%d path=\"%s\" (libusb vid=0x%x pid=0x%x name=\"%s\") — descriptors will be garbled",
-				device_id, device_path.c_str(),
+			// BUG-53: never hand libusb's failed-read / stale-memory strings to
+			// Dart.  Blank anything that is not printable ASCII so the identity
+			// layer takes its documented "Video Grabber (identifying…)" path
+			// instead of keying preferences off garbage.
+			if (!is_trustworthy_text(result.manufacturer_name, sizeof(result.manufacturer_name))) {
+				memset(result.manufacturer_name, 0, sizeof(result.manufacturer_name));
+			}
+			if (!is_trustworthy_text(result.product_name, sizeof(result.product_name))) {
+				memset(result.product_name, 0, sizeof(result.product_name));
+			}
+			if (!is_trustworthy_text(result.serial, sizeof(result.serial))) {
+				memset(result.serial, 0, sizeof(result.serial));
+			}
+			if (device_path.empty()) {
+				// No trustworthy path either — report an explicit unknown path so
+				// the Dart watchdog's invalid-path handling engages instead of
+				// acting on byte soup.
+				snprintf(reinterpret_cast<char*>(result.name), sizeof(result.name),
+					"/dev/bus/usb/unknown/%d", device_id);
+			}
+			LOGW("get_device_info: no Android cache for id=%d path=\"%s\" (libusb rc=%d vid=0x%x pid=0x%x name=\"%s\") — untrustworthy descriptors blanked",
+				device_id, device_path.c_str(), info_rc,
 				result.vendor_id, result.product_id,
 				reinterpret_cast<const char*>(result.name));
 		}
@@ -462,7 +554,7 @@ void FlutterPluginJava::prune_device_path(const std::string &device_path) {
 			++it;
 		}
 	}
-	LOGI("prune_device_path: %s (cache_size=%zu pending_size=%\" FMT_SIZE_T \")",
+	LOGI("prune_device_path: %s (cache_size=%" FMT_SIZE_T " pending_size=%" FMT_SIZE_T ")",
 		device_path.c_str(), android_device_info_cache.size(), pending_device_paths.size());
 
 	EXIT();
