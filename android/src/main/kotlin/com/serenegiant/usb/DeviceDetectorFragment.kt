@@ -81,6 +81,24 @@ class DeviceDetectorFragment constructor() : Fragment() {
 		private const val DEBUG = true
 		private const val RESET_READD_COOLDOWN_MS = 10_000L
 
+		/**
+		 * BUG-54: optional delegate that takes over USB permission prompting.
+		 *
+		 * The host app routes every prompt through a single queue
+		 * (PermissionQueueService) because Android shows exactly one dialog at a
+		 * time — a second request silently dismisses the first and the device
+		 * stays unauthorised.  This fragment used to request permission on its
+		 * own, which raced that queue; the two UVC cameras attach at nearly the
+		 * same moment, so they repeatedly dismissed each other's dialog.
+		 *
+		 * When set and it returns true, the request is considered handled and no
+		 * system dialog is shown from here.  The app then owns the prompt and is
+		 * responsible for re-enumerating after the grant (USBMonitor reports
+		 * `hasPermission` per device, so the next rescan picks it up).
+		 */
+		@JvmStatic
+		var permissionPromptDelegate: ((UsbDevice) -> Boolean)? = null
+
 		// Process-lifetime graveyard for closed UsbConnector objects.
 		// See the comment on mClosedConnectorGraveyard above for the full
 		// explanation of the fdsan double-close crash.
@@ -220,6 +238,12 @@ class DeviceDetectorFragment constructor() : Fragment() {
 					if (mUSBMonitor == null) return@postDelayed
 					synchronized(mConnectors) {
 						for (device in mUSBMonitor!!.deviceList.toList()) {
+							// BUG-54: cache every attached device's descriptors, not
+							// just the ones we are about to add — the cache must hold
+							// ALL cameras so a freshly minted runtime id can resolve
+							// its path and get clean values instead of libusb's
+							// truncated ones.
+							cacheDeviceDescriptors(device)
 							if (!mConnectors.containsKey(device)) {
 								if (DEBUG) Log.v(TAG, "onStart:re-scanning already-attached device:" + device.deviceName)
 								if (mUSBMonitor!!.hasPermission(device)) {
@@ -231,7 +255,7 @@ class DeviceDetectorFragment constructor() : Fragment() {
 									// Permission was lost (rare but possible) — re-request.
 									bringToForeground()
 									exitImmersiveMode()
-									mUSBMonitor!!.requestPermission(device)
+									requestPermission(device)
 								}
 							}
 						}
@@ -460,7 +484,7 @@ class DeviceDetectorFragment constructor() : Fragment() {
 					} else if (mUSBMonitor != null && !mUSBMonitor!!.hasPermission(device)) {
 						bringToForeground()
 						exitImmersiveMode()
-						mUSBMonitor!!.requestPermission(device)
+						requestPermission(device)
 					}
 				} finally {
 					synchronized(mSync) { mResetInFlightPaths.remove(path) }
@@ -504,6 +528,11 @@ class DeviceDetectorFragment constructor() : Fragment() {
 		}
 		synchronized(mConnectors) {
 			for (device in monitor.deviceList.toList()) {
+				// BUG-54: refresh the descriptor cache for every attached device
+				// on each rescan — this is the pass that runs after a permission
+				// grant, so it is what puts clean values in the cache before the
+				// next runtime id tries to resolve its path.
+				cacheDeviceDescriptors(device)
 				if (!mConnectors.containsKey(device)) {
 					if (DEBUG) Log.v(TAG, "rescanConnectedDevices: re-adding device: ${device.deviceName}")
 					// BUG-41/43: Try addDevice first (no prophylactic reset).
@@ -670,6 +699,53 @@ class DeviceDetectorFragment constructor() : Fragment() {
 		addDevice(device, retryCount = 0)
 	}
 
+	/**
+	 * BUG-54: request USB permission for [device], unless the host app has taken
+	 * over prompting (see [permissionPromptDelegate]).  Always go through here so
+	 * every site respects the delegation.
+	 */
+	private fun requestPermission(device: UsbDevice) {
+		val handled = try {
+			permissionPromptDelegate?.invoke(device) ?: false
+		} catch (e: Exception) {
+			Log.w(TAG, "permissionPromptDelegate threw (falling back to local prompt): ${e.message}")
+			false
+		}
+		if (handled) {
+			if (DEBUG) Log.v(TAG, "requestPermission: delegated for ${device.deviceName}")
+			return
+		}
+		mUSBMonitor!!.requestPermission(device)
+	}
+
+	/**
+	 * BUG-54: Hand the Android [UsbDevice] descriptors to the native layer.
+	 *
+	 * These values come from the framework's own enumeration, so they are
+	 * readable WITHOUT a USB permission grant — which is the point.  The cache
+	 * used to be populated only inside the `hasPermission()` branch below, so a
+	 * camera whose grant had not landed yet never had a cache entry and
+	 * get_device_info fell through to libusb, which returns truncated
+	 * single-character strings on a failed read ("AMG-FRONT" -> "A").  The
+	 * 1-char values then became the camera's stableUid, which broke pinning and
+	 * collapsed both cameras onto one identity.
+	 *
+	 * Non-fatal: a failure here only costs clean descriptors, never attach.
+	 */
+	private fun cacheDeviceDescriptors(device: UsbDevice) {
+		try {
+			nativeSetDeviceInfo(
+				device.deviceName,
+				device.vendorId, device.productId,
+				device.deviceClass, device.deviceSubclass, device.deviceProtocol,
+				device.manufacturerName, device.productName,
+				device.serialNumber
+			)
+		} catch (e: Exception) {
+			Log.w(TAG, "nativeSetDeviceInfo failed (non-fatal): ${e.message}")
+		}
+	}
+
 	private fun addDevice(device: UsbDevice, retryCount: Int) {
 		if (DEBUG) Log.v(TAG, "addDevice:" + device.deviceName + " (attempt ${retryCount + 1})")
 		// BUG-44: Guard against duplicate add for a device already tracked.
@@ -688,6 +764,12 @@ class DeviceDetectorFragment constructor() : Fragment() {
 				return
 			}
 		}
+		// BUG-54: cache descriptors BEFORE the permission gate.  The framework's
+		// descriptor values are readable without a grant, and a device that is
+		// granted later (or whose path another runtime id resolves to) must still
+		// find clean values here — the old placement inside the gate is what let
+		// libusb's truncated 1-char reads become the camera identity.
+		cacheDeviceDescriptors(device)
 		if (mUSBMonitor!!.hasPermission(device)) {
 			var connector: UsbConnector? = null
 			var storedInMap = false
@@ -702,17 +784,9 @@ class DeviceDetectorFragment constructor() : Fragment() {
 				// descriptors after a hub power-cycle.  By caching the Android
 				// UsbDevice values here, get_device_info can override the garbled
 				// fields with clean ones keyed by the device path.
-				try {
-					nativeSetDeviceInfo(
-						device.deviceName,
-						device.vendorId, device.productId,
-						device.deviceClass, device.deviceSubclass, device.deviceProtocol,
-						device.manufacturerName, device.productName,
-						device.serialNumber
-					)
-				} catch (e: Exception) {
-					Log.w(TAG, "nativeSetDeviceInfo failed (non-fatal): ${e.message}")
-				}
+				// BUG-54: already cached before the permission gate in addDevice();
+				// refresh here so a descriptor change between the two is picked up.
+				cacheDeviceDescriptors(device)
 				mDeviceDetector.add(device, connector.fileDescriptor)
 			} catch (e: IOException) {
 				// IOException here usually means USB bus is still settling (e.g. long cable,
@@ -799,7 +873,7 @@ class DeviceDetectorFragment constructor() : Fragment() {
 			Log.w(TAG, "addDevice: no permission for ${device.deviceName} — requesting")
 			bringToForeground()
 			exitImmersiveMode()
-			mUSBMonitor!!.requestPermission(device)
+			requestPermission(device)
 		}
 	}
 
@@ -937,6 +1011,11 @@ class DeviceDetectorFragment constructor() : Fragment() {
 	private val mOnDeviceConnectListener: USBMonitor.Callback = object : USBMonitor.Callback {
 		override fun onAttach(device: UsbDevice) {
 			if (DEBUG) Log.v(TAG, "Callback#onAttach:" + device.deviceName)
+			// BUG-54: cache the framework's descriptors immediately, before the
+			// permission branch — they are readable without a grant, and waiting
+			// for the grant is what left get_device_info with no cache entry to
+			// fall back on (so it returned libusb's truncated 1-char strings).
+			cacheDeviceDescriptors(device)
 			if (mUSBMonitor!!.hasPermission(device)) {
 				// すでにパーミッションを保持しているとき
 				// BUG-31: After a USB hub power-cycle, the MS210x may still be
@@ -966,7 +1045,7 @@ class DeviceDetectorFragment constructor() : Fragment() {
 				// fullscreen activity on devices like Lenovo TB373FU / Android 16.
 				bringToForeground()
 				exitImmersiveMode()
-				mUSBMonitor!!.requestPermission(device)
+				requestPermission(device)
 			}
 		}
 

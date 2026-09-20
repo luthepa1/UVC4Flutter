@@ -198,8 +198,23 @@ std::string FlutterPluginJava::resolve_device_path_locked(const int32_t &device_
 		bool alreadyClaimed = false;
 		for (const auto &entry : device_path_by_id) {
 			if (entry.first != device_id && entry.second == candidate) {
-				alreadyClaimed = true;
-				break;
+				// BUG-54: only a holder that is actually running counts as a live
+				// claim.  Kotlin's removeDevice() deliberately skips the native
+				// remove() (BUG-40: the native layer owns the FD), so
+				// device_path_by_id keeps an entry for every detached id forever.
+				// Treating those as live made the path permanently unbindable for
+				// the freshly attached camera: logcat 2026-09-20 shows
+				// "candidate=/dev/bus/usb/001/010 already claimed by another live
+				// id — skipping" on repeat with cache_size stuck at 1, so the real
+				// camera never reached its cached descriptors and fell through to
+				// the truncated libusb read instead.
+				const auto claimant = holders.find(entry.first);
+				if (claimant != holders.end() && claimant->second && claimant->second->is_running()) {
+					alreadyClaimed = true;
+					break;
+				}
+				LOGI("resolve_device_path_locked: candidate=\"%s\" claimed by non-live id=%d — treating claim as stale",
+					candidate.c_str(), entry.first);
 			}
 		}
 		if (alreadyClaimed) {
@@ -393,6 +408,34 @@ static bool is_trustworthy_text(const uint8_t *buf, size_t len) {
 	return true;
 }
 
+/**
+ * BUG-54: is this descriptor long enough to be a real USB string?
+ *
+ * is_trustworthy_text() above only rejects non-printable bytes, so a single
+ * printable character passes.  That is exactly what a failed libusb string read
+ * produces: a USB string descriptor is UTF-16LE, so consuming it as a C string
+ * stops at the first 0x00 and yields one byte —
+ *   "AMG-FRONT"    (41 00 4D 00 ...) -> "A"
+ *   "MACROSILICON" (4D 00 43 00 ...) -> "M"
+ *   "20200909"     (32 00 30 00 ...) -> "2"
+ * Logcat 2026-09-20 shows precisely this trio for every camera whose path could
+ * not be resolved to an Android-cached descriptor, and the 1-char values then
+ * became the camera's identity (stableUid "2"/"A"), which broke pinning, the
+ * duplicate squash and the reset gate all at once.
+ *
+ * Empty stays trustworthy so the identity layer can take its documented
+ * "Video Grabber (identifying…)" path.
+ */
+static bool is_plausible_descriptor(const uint8_t *buf, size_t len) {
+	if (!is_trustworthy_text(buf, len)) {
+		return false;
+	}
+	if (buf[0] == 0) {
+		return true;
+	}
+	return ::strnlen(reinterpret_cast<const char*>(buf), len) >= 2;
+}
+
 usb_device_info_t FlutterPluginJava::get_device_info(const int32_t &device_id) {
 	ENTER();
 
@@ -486,13 +529,22 @@ usb_device_info_t FlutterPluginJava::get_device_info(const int32_t &device_id) {
 			// Dart.  Blank anything that is not printable ASCII so the identity
 			// layer takes its documented "Video Grabber (identifying…)" path
 			// instead of keying preferences off garbage.
-			if (!is_trustworthy_text(result.manufacturer_name, sizeof(result.manufacturer_name))) {
+			// BUG-54: a truncated 1-char read ("A"/"M"/"2") is printable and so
+			// survived this check, then became the camera's identity.  Require a
+			// plausible length too.
+			if (!is_plausible_descriptor(result.manufacturer_name, sizeof(result.manufacturer_name))) {
+				LOGW("get_device_info: id=%d manufacturer_name=\"%s\" implausible — blanked",
+					device_id, reinterpret_cast<const char*>(result.manufacturer_name));
 				memset(result.manufacturer_name, 0, sizeof(result.manufacturer_name));
 			}
-			if (!is_trustworthy_text(result.product_name, sizeof(result.product_name))) {
+			if (!is_plausible_descriptor(result.product_name, sizeof(result.product_name))) {
+				LOGW("get_device_info: id=%d product_name=\"%s\" implausible — blanked",
+					device_id, reinterpret_cast<const char*>(result.product_name));
 				memset(result.product_name, 0, sizeof(result.product_name));
 			}
-			if (!is_trustworthy_text(result.serial, sizeof(result.serial))) {
+			if (!is_plausible_descriptor(result.serial, sizeof(result.serial))) {
+				LOGW("get_device_info: id=%d serial=\"%s\" implausible — blanked",
+					device_id, reinterpret_cast<const char*>(result.serial));
 				memset(result.serial, 0, sizeof(result.serial));
 			}
 			if (device_path.empty()) {
