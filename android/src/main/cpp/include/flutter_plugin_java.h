@@ -62,22 +62,47 @@ private:
 	 * Canonical mapping of runtime native device_id -> stable Android device path
 	 * (/dev/bus/usb/BBB/DDD). This lets get_device_info look up Android-side
 	 * cached metadata without trusting libusb's potentially garbled name field.
+	 *
+	 * BUG-55: only VERIFIED paths are ever entered here — either from a
+	 * successful usb_get_device_info() read (kernel truth) or from a
+	 * provably-unambiguous pending-queue candidate.  A wrong entry is
+	 * unrecoverable because resolve_device_path_locked() short-circuits on a
+	 * hit, so a guess cached here permanently hides the truth (that was the
+	 * 2026-09-21 camera-swap bug).  Never bind without proof.
 	 */
 	std::unordered_map<int32_t, std::string> device_path_by_id;
 	/**
 	 * Queue of recently seen Android device paths (from nativeSetDeviceInfo)
 	 * that have not yet been bound to a runtime native device_id.
+	 *
+	 * BUG-55: consulted ONLY when exactly one candidate remains unclaimed and
+	 * unbound.  Ordering here is meaningless as identity evidence — entries are
+	 * re-pushed to the BACK on every sighting while addDevice() caches the
+	 * attaching device's descriptors immediately before its attach callback
+	 * fires, so "first entry" is frequently the OTHER camera's path.
 	 */
 	std::deque<std::string> pending_device_paths;
 
 	/**
 	 * Bind runtime device_id to canonical Android device path.
 	 * Caller must hold m_lock.
+	 * BUG-55: accepts any well-formed /dev/bus/usb/BBB/DDD path, whether or not
+	 * Android descriptors are cached for it (a cache miss only costs the
+	 * descriptor override in get_device_info; refusing the bind is what forced
+	 * the resolver into its pending-queue guess).
 	 */
 	void bind_device_path_locked(const int32_t &device_id, const std::string &device_path);
 	/**
 	 * Resolve canonical Android device path for runtime device_id.
 	 * Caller must hold m_lock.
+	 *
+	 * BUG-55 contract: NEVER guesses.  Resolution order is (1) an already-bound
+	 * path, (2) usb_get_device_info() — the kernel-truth read, which FAILS while
+	 * the prebuilt library is still populating the freshly attached device's
+	 * entry, (3) the pending queue, but only when exactly one candidate is
+	 * unclaimed.  Returns an EMPTY string when the answer is not knowable yet;
+	 * callers must treat empty as "retry later", not "no path" (the next call
+	 * usually succeeds once the prebuilt entry is complete).
 	 */
 	std::string resolve_device_path_locked(const int32_t &device_id);
 

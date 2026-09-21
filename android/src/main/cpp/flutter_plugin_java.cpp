@@ -149,11 +149,30 @@ FlutterUVCHolderSp FlutterPluginJava::get_holder_locked(const int32_t &device_id
 	RET(result);
 }
 
+/**
+ * BUG-53: is this a USB device path we are willing to trust?
+ * Requires the exact "/dev/bus/usb/BBB/DDD" shape with digits only after the
+ * prefix.  usb_get_device_info() can leave a stray trailing byte when its
+ * control transfer fails, which produced paths like
+ * "/dev/bus/usb/001/007k" in logcat (2026-09-19 22:53).  Such a path misses
+ * the Android descriptor cache lookup, cascading into garbage descriptors.
+ *
+ * BUG-55: forward-declared because the path resolver (bind_device_path_locked /
+ * resolve_device_path_locked) now uses this same check as its only acceptance
+ * gate — it must not bind a guess OR a garbled string.
+ */
+static bool is_valid_usb_path(const std::string &path);
+
 void FlutterPluginJava::bind_device_path_locked(const int32_t &device_id, const std::string &device_path) {
 	if (device_path.empty()) return;
-	if (android_device_info_cache.find(device_path) == android_device_info_cache.end()) {
-		return;
-	}
+	// BUG-55: bind any WELL-FORMED kernel path, not only one that already has
+	// Android descriptors cached.  The old cache-membership guard meant a
+	// kernel-truth path discovered via libusb could not be bound until Kotlin
+	// had pushed descriptors for it — so the resolver fell through to the
+	// pending-queue guess and cached THAT instead.  The guard is now the same
+	// validity check get_device_info uses: it still rejects the garbage
+	// ("\x01", "/dev/bus/usb/unknown/N", trailing bytes) the guard existed for.
+	if (!is_valid_usb_path(device_path)) return;
 	device_path_by_id[device_id] = device_path;
 	pending_device_paths.erase(
 		std::remove(pending_device_paths.begin(), pending_device_paths.end(), device_path),
@@ -174,63 +193,99 @@ std::string FlutterPluginJava::resolve_device_path_locked(const int32_t &device_
 		LOGI("resolve_device_path_locked: device_id=%d libusb_name=\"%s\" (len=%d) vid=0x%x pid=0x%x",
 			device_id, from_libusb.c_str(), (int)from_libusb.length(),
 			info.vendor_id, info.product_id);
-		if (!from_libusb.empty() &&
-			android_device_info_cache.find(from_libusb) != android_device_info_cache.end()) {
+		// The kernel path is truth. Accept it whether or not Android has
+		// descriptors cached for it — a cache miss only costs the descriptor
+		// override in get_device_info, and binding it HERE is what stops the
+		// resolver from guessing below.
+		if (is_valid_usb_path(from_libusb)) {
 			bind_device_path_locked(device_id, from_libusb);
 			return from_libusb;
 		}
+		LOGW("resolve_device_path_locked: device_id=%d libusb name is not a usable path — not binding", device_id);
 	} else {
-		LOGW("resolve_device_path_locked: usb_get_device_info failed for device_id=%d", device_id);
+		LOGW("resolve_device_path_locked: usb_get_device_info failed for device_id=%d (prebuilt entry still being populated) — deferring bind",
+			device_id);
 	}
 
-	LOGI("resolve_device_path_locked: device_id=%d searching pending_device_paths (size=%" FMT_SIZE_T ")",
-		device_id, pending_device_paths.size());
-	for (auto it = pending_device_paths.begin(); it != pending_device_paths.end(); ++it) {
-		const auto &candidate = *it;
-		// BUG-51: skip candidates already bound to a DIFFERENT live runtime id.
-		// The stale off-by-one bound each fresh id to the PREVIOUS device's
-		// path (logcat 2026-09-19 16:42-16:43: front cam's new id bound to
-		// the rear cam's real path 016 while the kernel had already cached
-		// the front cam's fresh path 017).  A path already claimed by another
-		// live id is not pending — skipping it forces the resolver to keep
-		// searching for this device's own path (or fail loudly, which the
-		// Dart garbled-descriptor gate handles).
-		bool alreadyClaimed = false;
-		for (const auto &entry : device_path_by_id) {
-			if (entry.first != device_id && entry.second == candidate) {
-				// BUG-54: only a holder that is actually running counts as a live
-				// claim.  Kotlin's removeDevice() deliberately skips the native
-				// remove() (BUG-40: the native layer owns the FD), so
-				// device_path_by_id keeps an entry for every detached id forever.
-				// Treating those as live made the path permanently unbindable for
-				// the freshly attached camera: logcat 2026-09-20 shows
-				// "candidate=/dev/bus/usb/001/010 already claimed by another live
-				// id — skipping" on repeat with cache_size stuck at 1, so the real
-				// camera never reached its cached descriptors and fell through to
-				// the truncated libusb read instead.
-				const auto claimant = holders.find(entry.first);
-				if (claimant != holders.end() && claimant->second && claimant->second->is_running()) {
-					alreadyClaimed = true;
-					break;
-				}
-				LOGI("resolve_device_path_locked: candidate=\"%s\" claimed by non-live id=%d — treating claim as stale",
-					candidate.c_str(), entry.first);
-			}
-		}
-		if (alreadyClaimed) {
-			LOGI("resolve_device_path_locked: candidate=\"%s\" already claimed by another live id — skipping", candidate.c_str());
+	// ── BUG-55: the pending-queue heuristic is now UNAMBIGUOUS-ONLY ─────────
+	//
+	// This block used to bind the FIRST unclaimed queue entry.  That is the
+	// off-by-one that scrambled camera identity: set_device_info() re-pushes a
+	// path to the BACK of the queue on every sighting, and addDevice() caches
+	// the device's descriptors immediately before attaching it — so a
+	// re-attached camera's path lands at the back while the OTHER camera's
+	// stale path is still at the front.  Logcat 2026-09-21 16:26:41.207:
+	//
+	//   DeviceDetectorFragment: addDevice:/dev/bus/usb/001/005 (AMG-FRONT)
+	//   Callback#onConnected:/dev/bus/usb/001/005
+	//   resolve_device_path_locked: device_id=165182717 searching
+	//                               pending_device_paths (size=2)
+	//   resolve_device_path_locked: pending candidate="/dev/bus/usb/001/010"
+	//   resolve_device_path_locked: bound device_id=165182717 to pending
+	//                               path="/dev/bus/usb/001/010"   ← the REAR path
+	//
+	// Worse, the wrong bind was CACHED in device_path_by_id, and the early
+	// return at the top of this function then short-circuited every later
+	// resolution — so the libusb truth was never consulted again and the two
+	// cameras stayed swapped for the life of the process (Dart read the other
+	// camera's iProduct, so the AMG-FRONT / AMG-REAR pins landed on the wrong
+	// hardware).  BUG-51's "alreadyClaimed" term only stopped two ids sharing
+	// one path; it converted "both wrong" into "swapped".
+	//
+	// Doctrine: NEVER cache a guess.  If the attach window hasn't populated the
+	// prebuilt entry yet, return empty and let the next call retry — by then
+	// usb_get_device_info() succeeds and the true path binds above.  The caller
+	// copes: add() only logs, and get_device_info() blanks untrustworthy
+	// descriptors rather than reporting another camera's.
+	//
+	// The queue is still consulted for the one case where it cannot be wrong:
+	// exactly ONE candidate that is neither claimed by a live holder nor bound
+	// to another id.  With two cameras attached that is never true — which is
+	// exactly the point.
+	std::string uniqueCandidate;
+	int unclaimedCount = 0;
+	for (const auto &candidate : pending_device_paths) {
+		if (candidate.empty() ||
+			android_device_info_cache.find(candidate) == android_device_info_cache.end()) {
 			continue;
 		}
-		LOGI("resolve_device_path_locked: pending candidate=\"%s\" in_cache=%d",
-			candidate.c_str(),
-			android_device_info_cache.find(candidate) != android_device_info_cache.end() ? 1 : 0);
-		if (!candidate.empty() &&
-			android_device_info_cache.find(candidate) != android_device_info_cache.end()) {
-			device_path_by_id[device_id] = candidate;
-			pending_device_paths.erase(it);
-			LOGI("resolve_device_path_locked: bound device_id=%d to pending path=\"%s\"", device_id, candidate.c_str());
-			return candidate;
+		// BUG-51: skip candidates already bound to a DIFFERENT id.  BUG-54: only
+		// a holder that is actually RUNNING counts as a live claim — Kotlin's
+		// removeDevice() deliberately skips the native remove() (BUG-40: the
+		// native layer owns the FD), so device_path_by_id keeps an entry for
+		// every detached id forever and treating those as live made a path
+		// permanently unbindable for the freshly attached camera.
+		bool taken = false;
+		for (const auto &entry : device_path_by_id) {
+			if (entry.first == device_id || entry.second != candidate) continue;
+			const auto claimant = holders.find(entry.first);
+			if (claimant != holders.end() && claimant->second && claimant->second->is_running()) {
+				taken = true;
+				break;
+			}
 		}
+		if (taken) {
+			LOGI("resolve_device_path_locked: candidate=\"%s\" is claimed by a live holder — excluded",
+				candidate.c_str());
+			continue;
+		}
+		uniqueCandidate = candidate;
+		if (++unclaimedCount > 1) break;
+	}
+
+	if (unclaimedCount == 1) {
+		LOGI("resolve_device_path_locked: exactly one unclaimed candidate (\"%s\") — binding device_id=%d",
+			uniqueCandidate.c_str(), device_id);
+		device_path_by_id[device_id] = uniqueCandidate;
+		pending_device_paths.erase(
+			std::remove(pending_device_paths.begin(), pending_device_paths.end(), uniqueCandidate),
+			pending_device_paths.end());
+		return uniqueCandidate;
+	}
+
+	if (unclaimedCount > 1) {
+		LOGW("resolve_device_path_locked: device_id=%d has %d unclaimed candidates in the pending queue — REFUSING to guess (a wrong bind is cached and unrecoverable); deferring to the next libusb read",
+			device_id, unclaimedCount);
 	}
 
 	LOGW("resolve_device_path_locked: FAILED to resolve path for device_id=%d (cache_size=%" FMT_SIZE_T " pending_size=%" FMT_SIZE_T ")",
