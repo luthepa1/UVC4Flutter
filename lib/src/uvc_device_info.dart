@@ -34,14 +34,19 @@ final class DeviceInfo {
   final String productName;
   /// シリアル番号(読み取れない機器は空文字列)
   final String serial;
+  /// USB仕様バージョン(bcdUSB)。デバイス記述子の bcdUSB で、その機器が実際に
+  /// 動いている速度帯を表す: 0x0300 以上 = SuperSpeed、0x0200 = High Speed。
+  /// 0 は「ネイティブが値を返さなかった」を意味し、不明として扱うこと。
+  final int bcdUsb;
 
   /// コンストラクタ
   DeviceInfo(this.vendorId, this.productId, this.deviceClass,
       this.deviceSubClass, this.deviceProtocol, this.reserved1, this.name,
-      this.manufacturerName, this.productName, this.serial);
+      this.manufacturerName, this.productName, this.serial,
+      {this.bcdUsb = 0});
 
   @override
   String toString() {
-    return 'DeviceInfo{vendorId:$vendorId, productId:$productId, deviceClass:$deviceClass, deviceSubClass:$deviceSubClass, deviceProtocol:$deviceProtocol, reserved1:$reserved1, name:$name, manufacturerName:$manufacturerName, productName:$productName, serial:$serial}';
+    return 'DeviceInfo{vendorId:$vendorId, productId:$productId, deviceClass:$deviceClass, deviceSubClass:$deviceSubClass, deviceProtocol:$deviceProtocol, reserved1:$reserved1, bcdUsb:0x${bcdUsb.toRadixString(16).padLeft(4, '0')}, name:$name, manufacturerName:$manufacturerName, productName:$productName, serial:$serial}';
   }
 }

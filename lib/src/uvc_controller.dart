@@ -683,7 +683,8 @@ DeviceInfo _createDeviceInfoFrom(flutter_device_info info) {
   _arrayToString(info.name),
   _arrayToString(info.manufacturer_name),
   _arrayToString(info.product_name),
-  _arrayToString(info.serial));
+  _arrayToString(info.serial),
+  bcdUsb: info.bcd_usb);
 }
 
 /// uint8_t配列からUTF8と見なしてdartのStringへ変換するヘルパー関数
