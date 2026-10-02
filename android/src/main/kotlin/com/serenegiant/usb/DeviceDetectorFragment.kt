@@ -60,17 +60,18 @@ class DeviceDetectorFragment constructor() : Fragment() {
 	// (seen in logcat as: FinalizerDaemon → UsbConnector.finalize → usb_device_close
 	// → fdsan: attempted to close file descriptor N, expected to be unowned).
 	//
-	// This is a companion-object (process-lifetime) graveyard, NOT an instance
-	// field. The previous instance-field graveyard was cleared in onDetach(),
-	// but the GC could run after fragment destruction and still finalize the
-	// connectors — the crash logcat (2026-07-11) shows FinalizerDaemon triggering
-	// 6 seconds after removeDevice closed the connector. A process-lifetime
-	// graveyard ensures the finalizer never runs until the process exits.
-	// We cap it to 32 entries to avoid unbounded memory growth across many
-	// open/close cycles; once full, the oldest entry is released (its FD is
-	// long-closed by now, and the OS will have moved on to new FDs).
+	// Superseded, but retained: this instance list is cleared in onStart(), so it
+	// provides NO finalizer protection — `sGlobalGraveyard` (companion object
+	// below) is the list that actually holds the strong references for the
+	// process lifetime.
+	//
+	// Corrected 2026-09-27: the comment here used to claim "we cap it to 32
+	// entries … once full, the oldest entry is released". Nothing evicts from
+	// either list, so both grow for the life of the process — the cap was
+	// described but never written. Not implemented now: the retention IS the
+	// mechanism (BUG-33), and capping it would reintroduce the finalizer
+	// double-close it exists to prevent.
 	private val mClosedConnectorGraveyard: MutableList<UsbConnector> = mutableListOf()
-	private var mPendingCloseCount: Int = 0 // BUG-21b: staggered close delay counter
 	// BUG-43: Debounce reset/re-add storms for the same USB path.
 	// Key = UsbDevice.deviceName (/dev/bus/usb/NNN/NNN)
 	private val mLastResetByPathMs: MutableMap<String, Long> = HashMap()
@@ -606,8 +607,17 @@ class DeviceDetectorFragment constructor() : Fragment() {
 			it.deviceName == devicePath
 		}
 		if (target == null) {
-			Log.w(TAG, "forceResetDeviceByPath: no device found at path $devicePath — falling back to forceResetAllUvcDevices")
-			forceResetAllUvcDevices()
+			// Deliberately NOT falling back to forceResetAllUvcDevices().
+			// USBDEVFS_RESET is addressed by node, so "the node I recorded is
+			// gone" means the physical device moved — the kernel recycles
+			// /dev/bus/usb/BBB/DDD — not that some other camera is at fault.
+			// Logcat 2026-09-26 14:16:35 shows the old fallback resetting
+			// /dev/bus/usb/001/005 (AMG-REAR) and /dev/bus/usb/001/003
+			// (AMG-FRONT) to chase one stale record for a third runtime id;
+			// the rear camera never streamed again after it.  A vanished path
+			// is a no-op here — the Dart side re-resolves the node from the
+			// live controller before asking (see isStaleResetTarget).
+			Log.w(TAG, "forceResetDeviceByPath: no device found at path $devicePath — ignoring (stale node; refusing to reset other cameras)")
 			return
 		}
 
@@ -642,8 +652,14 @@ class DeviceDetectorFragment constructor() : Fragment() {
 		}
 
 		// Known UVC video grabber VID:PIDs
+		// NOTE: 0x345f:0x0001 ("MS213xS ROM") is deliberately absent — it is the
+		// chip's bootloader mode and has no UVC interfaces to reset.
 		val uvcVidPids = setOf(
 			Pair(0x534D, 0x0021),  // MS210x (EasierCAP) — confirmed via live lsusb
+			Pair(0x345F, 0x2130),  // MS213x (MS2130) USB-3 grabber
+			Pair(0x345F, 0x2131),  // MS2131
+			Pair(0x345F, 0x2132),  // MS2130S
+			Pair(0x345F, 0x2133),  // MS2133 / Guermok (confirmed via live lsusb)
 		)
 
 		var resetCount = 0
@@ -880,30 +896,33 @@ class DeviceDetectorFragment constructor() : Fragment() {
 	/**
 	* native側から登録解除する
 	*
-	 * BUG-21 (fdsan SIGABRT via Parcel-owned FD on rapid detach):
+	 * Current behaviour after BUG-33 and BUG-40 superseded the original
+	 * BUG-21 / BUG-21b design this comment used to describe:
 	 *
-	 * When all USB devices detach simultaneously (e.g. car ignition off),
-	 * the UsbDetector async thread fires onDetach() for each device in rapid
-	 * succession.  nativeRemove(name) returns the FD to the native C++ side
-	 * for cleanup, but the native Parcel that wrapped the FD may not have
-	 * fully released ownership yet.  If we call UsbConnector.close()
-	 * immediately after nativeRemove(), the close() races with the Parcel
-	 * cleanup → fdsan detects "attempted to close file descriptor N, expected
-	 * to be unowned, actually owned by Parcel" → SIGABRT.
+	 *  1. `mDeviceDetector.remove()` is NOT called (BUG-40).  On physical unplug
+	 *     that path reached UVCCameraBase::~UVCCameraBase() → std::thread::~thread()
+	 *     → std::terminate() — an uncatchable SIGABRT.  The native side is left to
+	 *     clean up when the FD becomes invalid.
+	 *  2. `UsbConnector.close()` is NOT called (BUG-33).  While the native holder
+	 *     owns the fd via a unique_fd, closing from Java double-closes it and fdsan
+	 *     aborts.  The deferred/staggered close the old comment described is gone.
+	 *  3. The connector is removed from mConnectors and retained in the graveyard
+	 *     so `UsbConnector.finalize()` can never run.
 	 *
-	 * Fix: post the UsbConnector.close() + graveyard retention to the async
-	 * handler with a staggered delay, giving the native C++ layer time to fully
-	 * release the FD from its Parcel before the Java side closes it.  The
-	 * connector is removed from mConnectors immediately so no new operations
-	 * can target it, but the actual close() is deferred.
+	 * KNOWN CONSEQUENCE — nothing closes the fd on this path.  BUG-33's rule was
+	 * safe *because the native side closed first*; BUG-40 removed that close, so as
+	 * written the camera's fd stays open until the process exits.  Measured on the
+	 * tablet 2026-09-27 (every device unplugged): three dead
+	 * `/dev/bus/usb/<node> (deleted)` handles per camera node.  A held handle is not
+	 * inert — usbfs will not hand an interface to a new claim while another usbfs
+	 * user holds it, and `claimInterface(iface, true)` is implemented as
+	 * USBDEVFS_DISCONNECT_CLAIM with EXCEPT_DRIVER = "usbfs", so force = true does
+	 * not steal it either, *not even from our own stale handle*.  That is what makes
+	 * the app block its own next open on a node while other apps see the device fine.
 	 *
-	 * BUG-21b: When ALL USB devices detach simultaneously (car ignition off),
-	 * multiple removeDevice() calls fire within milliseconds.  Each schedules
-	 * a 150ms delayed close, but they all fire at roughly the same time.  The
-	 * native C++ layer processes FD releases sequentially, so by the time the
-	 * later closes fire, the FDs may have been claimed by unique_fd on the
-	 * native side.  Fix: use a longer base delay (300ms) and stagger each
-	 * additional close by 100ms so they don't all fire at once.
+	 * Fixing it is an EXPERIMENT, not a cleanup — see Tier 3 of
+	 * ~/.commandcode/plans/uvc-graveyard-and-usb-cleanup.md.  Do not simply add
+	 * close() here; check this bug's ledger row first.
 	 *
 	 * @param device
 	 */
